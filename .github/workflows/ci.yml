@@ -156,7 +156,7 @@ jobs:
       - name: Build optimized WASM contract
         run: make -C contracts/sorobanlard optimize
         env:
-          CARGO_TARGET_DIR: target
+          CARGO_TARGET_DIR: ${{ github.workspace }}/contracts/sorobanlard/target
       - name: Check optimized WASM size
         run: |
           wasm=contracts/sorobanlard/target/wasm32v1-none/release/sorobanlard.optimized.wasm
