@@ -142,28 +142,34 @@ jobs:
           fail_ci_if_error: false
 
   wasm-build:
-    name: WASM Build (wasm32-unknown-unknown)
+    name: WASM Build (wasm32v1-none)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
         with:
           toolchain: stable
-      - name: Install wasm32 target
-        run: rustup target add wasm32-unknown-unknown
-      - name: Build WASM contracts
-        run: make build
+      - name: Install wasm32v1-none target
+        run: rustup target add wasm32v1-none
+      - name: Install Stellar CLI
+        run: cargo install --locked stellar-cli --features opt
+      - name: Build optimized WASM contract
+        run: make -C contracts/sorobanlard optimize
+        env:
+          CARGO_TARGET_DIR: target
       - name: Check optimized WASM size
         run: |
-          for wasm in target/wasm32-unknown-unknown/release/*.wasm; do
-            size=$(stat -f%z "$wasm" 2>/dev/null || stat -c%s "$wasm" 2>/dev/null)
-            name=$(basename "$wasm")
-            echo "$name: $size bytes"
-            if [ "$size" -gt 262144 ]; then
-              echo "ERROR: $name exceeds 256 KiB limit"
-              exit 1
-            fi
-          done
+          wasm=contracts/sorobanlard/target/wasm32v1-none/release/sorobanlard.optimized.wasm
+          if [ ! -f "$wasm" ]; then
+            echo "ERROR: optimized WASM artifact not found: $wasm"
+            exit 1
+          fi
+          size=$(stat -c%s "$wasm")
+          echo "$(basename "$wasm"): $size bytes"
+          if [ "$size" -gt 262144 ]; then
+            echo "ERROR: $(basename "$wasm") exceeds 256 KiB limit"
+            exit 1
+          fi
 
   audit:
     name: Dependency Audit
