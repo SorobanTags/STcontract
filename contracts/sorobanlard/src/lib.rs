@@ -2797,7 +2797,10 @@ impl SorobanLardContract {
             &enrollment,
         );
 
-        Self::extend_persistent_ttl(env, &DataKey::Enrollment(student.clone(), course_id.clone()));
+        Self::extend_persistent_ttl(
+            env,
+            &DataKey::Enrollment(student.clone(), course_id.clone()),
+        );
 
         // Update course stats
         course.total_enrollments = course
@@ -2988,7 +2991,10 @@ impl SorobanLardContract {
             &enrollment,
         );
 
-        Self::extend_persistent_ttl(env, &DataKey::Enrollment(student.clone(), course_id.clone()));
+        Self::extend_persistent_ttl(
+            env,
+            &DataKey::Enrollment(student.clone(), course_id.clone()),
+        );
 
         course.total_enrollments = course
             .total_enrollments
@@ -3416,7 +3422,10 @@ impl SorobanLardContract {
             &DataKey::Enrollment(student.clone(), course_id.clone()),
             &enrollment,
         );
-        Self::extend_persistent_ttl(&env, &DataKey::Enrollment(student.clone(), course_id.clone()));
+        Self::extend_persistent_ttl(
+            &env,
+            &DataKey::Enrollment(student.clone(), course_id.clone()),
+        );
 
         // Update active enrollments count on course
         let mut course = Self::get_course_internal(&env, &course_id)
@@ -3584,7 +3593,10 @@ impl SorobanLardContract {
             &DataKey::Enrollment(student.clone(), course_id.clone()),
             &enrollment,
         );
-        Self::extend_persistent_ttl(&env, &DataKey::Enrollment(student.clone(), course_id.clone()));
+        Self::extend_persistent_ttl(
+            &env,
+            &DataKey::Enrollment(student.clone(), course_id.clone()),
+        );
 
         // Increment certificate count for course
         course.certificates_issued = course
@@ -5164,7 +5176,13 @@ impl SorobanLardContract {
 
         env.events().publish(
             (Symbol::new(&env, "storage_migrated"), admin1.clone()),
-            (from_version, version, admin1, admin2, env.ledger().sequence()),
+            (
+                from_version,
+                version,
+                admin1,
+                admin2,
+                env.ledger().sequence(),
+            ),
         );
     }
 
@@ -5189,7 +5207,10 @@ impl SorobanLardContract {
             //           storage.set(&key, &Course::from_v1(old));
             //       }
             //   }
-            _ => panic!("no migration step defined for schema version {}", from_version),
+            _ => panic!(
+                "no migration step defined for schema version {}",
+                from_version
+            ),
         }
     }
 

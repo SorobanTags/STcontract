@@ -3874,7 +3874,10 @@ fn test_archive_moves_record_and_get_course_returns_archive_during_cooldown() {
         &BytesN::from_array(&env, &[1u8; 32]),
         &soroban_sdk::Vec::new(&env),
     );
-    assert!(reregister.is_err(), "archived course ID must remain reserved");
+    assert!(
+        reregister.is_err(),
+        "archived course ID must remain reserved"
+    );
 
     env.ledger().with_mut(|l| {
         l.sequence_number = archived_at + SorobanLardContract::ARCHIVE_COOLDOWN_LEDGERS - 1;
@@ -3883,10 +3886,7 @@ fn test_archive_moves_record_and_get_course_returns_archive_during_cooldown() {
     assert_eq!(course_during_cooldown.id, course_id);
     assert_eq!(course_during_cooldown.instructor, instructor);
     assert_eq!(course_during_cooldown.status, CourseStatus::Archived);
-    assert_eq!(
-        course_during_cooldown.archived_at_ledger,
-        Some(archived_at)
-    );
+    assert_eq!(course_during_cooldown.archived_at_ledger, Some(archived_at));
 }
 
 // ============================================================
@@ -10005,9 +10005,10 @@ fn benchmark_bulk_revoke_course_certificates_100_items() {
                 .set(&DataKey::Certificate(certificate_id.clone()), &certificate);
             certificate_ids.push_back(certificate_id);
         }
-        env.storage()
-            .persistent()
-            .set(&DataKey::CourseCertificates(course_id.clone()), &certificate_ids);
+        env.storage().persistent().set(
+            &DataKey::CourseCertificates(course_id.clone()),
+            &certificate_ids,
+        );
     });
 
     let cpu_before = env.cost_estimate().budget().cpu_instruction_cost();
@@ -10968,7 +10969,11 @@ fn test_list_courses_offset_and_limit_past_end_never_panics() {
 
         assert_eq!(page.len(), end - start, "seed {seed}");
         for i in 0..page.len() {
-            assert_eq!(page.get(i), catalog.get(start + i), "seed {seed}, index {i}");
+            assert_eq!(
+                page.get(i),
+                catalog.get(start + i),
+                "seed {seed}, index {i}"
+            );
         }
     }
 }
@@ -11068,8 +11073,15 @@ fn test_escalation_creates_retrievable_arbitration_case() {
         "case must record the escalating student"
     );
     assert_eq!(case.course_id, course_id, "case must record the course id");
-    assert_eq!(case.fee_paid, fee_per_case, "fee_paid must match config.fee_per_case");
-    assert_eq!(case.status, DisputeStatus::Open, "newly created case must be Open");
+    assert_eq!(
+        case.fee_paid, fee_per_case,
+        "fee_paid must match config.fee_per_case"
+    );
+    assert_eq!(
+        case.status,
+        DisputeStatus::Open,
+        "newly created case must be Open"
+    );
     assert!(
         case.resolved_by.is_none(),
         "an open case must not have a resolver"
@@ -11237,7 +11249,11 @@ fn test_arbitration_cases_indexed_by_student() {
     client.escalate_to_arbitration(&student, &String::from_str(&env, "COURSE-ARB-STUDENT-B"));
 
     let cases = client.get_arbitration_cases_by_student(&student);
-    assert_eq!(cases.len(), 2, "both of the student's disputes must be indexed");
+    assert_eq!(
+        cases.len(),
+        2,
+        "both of the student's disputes must be indexed"
+    );
     assert_eq!(
         cases.get(0).unwrap().course_id,
         String::from_str(&env, "COURSE-ARB-STUDENT-A")
@@ -11462,14 +11478,7 @@ fn test_full_lifecycle_dispute_resolved_for_student() {
 
     // Resolve for the student: the fee is refunded from the contract.
     let reason = String::from_str(&env, "COURSE_NOT_DELIVERED");
-    client.resolve_arbitration(
-        &admin,
-        &sec_admin,
-        &student,
-        &course_id,
-        &true,
-        &reason,
-    );
+    client.resolve_arbitration(&admin, &sec_admin, &student, &course_id, &true, &reason);
 
     // Final balances: student made whole on the fee, instructor earnings and
     // treasury revenue are unchanged by the dispute outcome.
@@ -11576,14 +11585,7 @@ fn test_full_lifecycle_dispute_resolved_for_instructor() {
 
     // Resolve for the instructor: the fee is paid out of the contract.
     let reason = String::from_str(&env, "STUDENT_CLAIM_NOT_SUBSTANTIATED");
-    client.resolve_arbitration(
-        &admin,
-        &sec_admin,
-        &student,
-        &course_id,
-        &false,
-        &reason,
-    );
+    client.resolve_arbitration(&admin, &sec_admin, &student, &course_id, &false, &reason);
 
     // Final balances: the student's fee is forfeited to the instructor; the
     // enrollment split itself is untouched.
@@ -11637,7 +11639,13 @@ fn test_instructor_can_escalate_arbitration() {
 
     let fee_per_case = 5_000_000i128;
     let _student = setup_arbitration(
-        &env, &client, &token_id, &admin, &instructor, "COURSE-ARB-INSTRUCTOR", fee_per_case,
+        &env,
+        &client,
+        &token_id,
+        &admin,
+        &instructor,
+        "COURSE-ARB-INSTRUCTOR",
+        fee_per_case,
     );
     let course_id = String::from_str(&env, "COURSE-ARB-INSTRUCTOR");
 
@@ -11672,7 +11680,13 @@ fn test_arbitration_timeout_boundary_auto_refunds_caller() {
 
     let fee_per_case = 5_000_000i128;
     let student = setup_arbitration(
-        &env, &client, &token_id, &admin, &instructor, "COURSE-ARB-TIMEOUT", fee_per_case,
+        &env,
+        &client,
+        &token_id,
+        &admin,
+        &instructor,
+        "COURSE-ARB-TIMEOUT",
+        fee_per_case,
     );
     let course_id = String::from_str(&env, "COURSE-ARB-TIMEOUT");
 
@@ -11740,7 +11754,13 @@ fn test_resolve_arbitration_after_timeout_rejected() {
 
     let fee_per_case = 5_000_000i128;
     let student = setup_arbitration(
-        &env, &client, &token_id, &admin, &instructor, "COURSE-ARB-LATE", fee_per_case,
+        &env,
+        &client,
+        &token_id,
+        &admin,
+        &instructor,
+        "COURSE-ARB-LATE",
+        fee_per_case,
     );
     let course_id = String::from_str(&env, "COURSE-ARB-LATE");
 
@@ -11771,7 +11791,13 @@ fn test_arbitration_timeout_cannot_claim_resolved_case() {
 
     let fee_per_case = 5_000_000i128;
     let student = setup_arbitration(
-        &env, &client, &token_id, &admin, &instructor, "COURSE-ARB-SETTLED", fee_per_case,
+        &env,
+        &client,
+        &token_id,
+        &admin,
+        &instructor,
+        "COURSE-ARB-SETTLED",
+        fee_per_case,
     );
     let course_id = String::from_str(&env, "COURSE-ARB-SETTLED");
 
@@ -11889,7 +11915,13 @@ mod invariants {
         let price: i128 = 1_000_000_000;
         token::StellarAssetClient::new(&env, &token_id).mint(&student, &price);
         register_and_approve_course(
-            &env, &client, &token_id, &admin, &instructor, "COURSE-INV-01", price,
+            &env,
+            &client,
+            &token_id,
+            &admin,
+            &instructor,
+            "COURSE-INV-01",
+            price,
         );
         let course_id = String::from_str(&env, "COURSE-INV-01");
 
@@ -11898,7 +11930,9 @@ mod invariants {
 
         let treasury_fee = token_client.balance(&treasury);
         let instructor_credit = client.get_instructor_earnings(&instructor, &token_id);
-        let enrollment = client.get_enrollment(&student, &student, &course_id).unwrap();
+        let enrollment = client
+            .get_enrollment(&student, &student, &course_id)
+            .unwrap();
         let course = client.get_course(&course_id).unwrap();
 
         assert_eq!(token_client.balance(&student), 0);
@@ -11923,7 +11957,13 @@ mod invariants {
         let student = Address::generate(&env);
         token::StellarAssetClient::new(&env, &token_id).mint(&student, &100_000_000_000);
         register_and_approve_course(
-            &env, &client, &token_id, &admin, &instructor, "COURSE-INV-02", 500_000_000,
+            &env,
+            &client,
+            &token_id,
+            &admin,
+            &instructor,
+            "COURSE-INV-02",
+            500_000_000,
         );
         let course_id = String::from_str(&env, "COURSE-INV-02");
 
@@ -11941,7 +11981,13 @@ mod invariants {
         let student = Address::generate(&env);
         token::StellarAssetClient::new(&env, &token_id).mint(&student, &100_000_000_000);
         register_and_approve_course(
-            &env, &client, &token_id, &admin, &instructor, "COURSE-INV-03", 400_000_000,
+            &env,
+            &client,
+            &token_id,
+            &admin,
+            &instructor,
+            "COURSE-INV-03",
+            400_000_000,
         );
         client.enroll(&student, &String::from_str(&env, "COURSE-INV-03"));
 
@@ -11968,7 +12014,13 @@ mod invariants {
         let student = Address::generate(&env);
         token::StellarAssetClient::new(&env, &token_id).mint(&student, &100_000_000_000);
         register_and_approve_course(
-            &env, &client, &token_id, &admin, &instructor, "COURSE-INV-04", 600_000_000,
+            &env,
+            &client,
+            &token_id,
+            &admin,
+            &instructor,
+            "COURSE-INV-04",
+            600_000_000,
         );
         let course_id = String::from_str(&env, "COURSE-INV-04");
         let cert_id = String::from_str(&env, "CERT-INV-04");
@@ -12040,7 +12092,13 @@ mod invariants {
         let student = Address::generate(&env);
         token::StellarAssetClient::new(&env, &token_id).mint(&student, &1_000_000_000);
         register_and_approve_course(
-            &env, &client, &token_id, &admin, &instructor, "COURSE-INV-06", 500_000_000,
+            &env,
+            &client,
+            &token_id,
+            &admin,
+            &instructor,
+            "COURSE-INV-06",
+            500_000_000,
         );
         client.enroll(&student, &String::from_str(&env, "COURSE-INV-06"));
 
@@ -12059,7 +12117,13 @@ mod invariants {
         let student = Address::generate(&env);
         token::StellarAssetClient::new(&env, &token_id).mint(&student, &1_000_000_000);
         register_and_approve_course(
-            &env, &client, &token_id, &admin, &instructor, "COURSE-INV-06B", 500_000_000,
+            &env,
+            &client,
+            &token_id,
+            &admin,
+            &instructor,
+            "COURSE-INV-06B",
+            500_000_000,
         );
         client.enroll(&student, &String::from_str(&env, "COURSE-INV-06B"));
 
@@ -12082,13 +12146,22 @@ mod invariants {
 
         let fee_per_case = 5_000_000i128;
         let student = setup_arbitration(
-            &env, &client, &token_id, &admin, &instructor, "COURSE-INV-07", fee_per_case,
+            &env,
+            &client,
+            &token_id,
+            &admin,
+            &instructor,
+            "COURSE-INV-07",
+            fee_per_case,
         );
         let course_id = String::from_str(&env, "COURSE-INV-07");
 
         let held_before = token_client.balance(&contract_id);
         client.escalate_to_arbitration(&student, &course_id);
-        assert_eq!(token_client.balance(&contract_id) - held_before, fee_per_case);
+        assert_eq!(
+            token_client.balance(&contract_id) - held_before,
+            fee_per_case
+        );
 
         env.mock_all_auths_allowing_non_root_auth();
         client.resolve_arbitration(
@@ -12111,7 +12184,13 @@ mod invariants {
         let client = SorobanLardContractClient::new(&env, &contract_id);
 
         let student = setup_arbitration(
-            &env, &client, &token_id, &admin, &instructor, "COURSE-INV-07B", 5_000_000,
+            &env,
+            &client,
+            &token_id,
+            &admin,
+            &instructor,
+            "COURSE-INV-07B",
+            5_000_000,
         );
         let course_id = String::from_str(&env, "COURSE-INV-07B");
 
@@ -12325,7 +12404,13 @@ fn test_enroll_rolls_back_when_second_split_transfer_fails() {
 
     let price = 100_000_000i128;
     register_and_approve_course(
-        &env, &client, &token_id, &admin, &instructor, "COURSE-SPLIT-FAIL", price,
+        &env,
+        &client,
+        &token_id,
+        &admin,
+        &instructor,
+        "COURSE-SPLIT-FAIL",
+        price,
     );
     let course_id = String::from_str(&env, "COURSE-SPLIT-FAIL");
 
@@ -12333,7 +12418,10 @@ fn test_enroll_rolls_back_when_second_split_transfer_fails() {
     // (contract → treasury) panics.
     token.fail_on_transfer(&2);
     let result = client.try_enroll(&student, &course_id);
-    assert!(result.is_err(), "enroll must fail when the split transfer fails");
+    assert!(
+        result.is_err(),
+        "enroll must fail when the split transfer fails"
+    );
 
     // No Enrollment record
     assert!(!client.is_enrolled(&student, &course_id));
@@ -12416,13 +12504,31 @@ fn test_reconciliation_instructor_earnings_match_contract_balance() {
     }
 
     register_and_approve_course(
-        &env, &client, &token_id, &admin, &instructor, "RECON-A", 1_000_000_000,
+        &env,
+        &client,
+        &token_id,
+        &admin,
+        &instructor,
+        "RECON-A",
+        1_000_000_000,
     );
     register_and_approve_course(
-        &env, &client, &token_id, &admin, &instructor_2, "RECON-B", 500_000_000,
+        &env,
+        &client,
+        &token_id,
+        &admin,
+        &instructor_2,
+        "RECON-B",
+        500_000_000,
     );
     register_and_approve_course(
-        &env, &client, &token_id, &admin, &instructor, "RECON-C", 300_000_000,
+        &env,
+        &client,
+        &token_id,
+        &admin,
+        &instructor,
+        "RECON-C",
+        300_000_000,
     );
     let course_a = String::from_str(&env, "RECON-A");
     let course_b = String::from_str(&env, "RECON-B");
@@ -12479,7 +12585,13 @@ fn test_enroll_rejects_fee_on_transfer_token() {
     let (token_id, token) =
         setup_non_standard_token(&env, &client, &admin, &student, 1_000_000_000);
     register_and_approve_course(
-        &env, &client, &token_id, &admin, &instructor, "COURSE-FEE-TOKEN", 100_000_000,
+        &env,
+        &client,
+        &token_id,
+        &admin,
+        &instructor,
+        "COURSE-FEE-TOKEN",
+        100_000_000,
     );
 
     token.set_transfer_fee_bps(&100); // 1% fee on every transfer
@@ -12501,7 +12613,13 @@ fn test_withdraw_earnings_with_fee_on_transfer_token_underpays_instructor() {
         setup_non_standard_token(&env, &client, &admin, &student, 1_000_000_000);
     let price = 100_000_000i128;
     register_and_approve_course(
-        &env, &client, &token_id, &admin, &instructor, "COURSE-FEE-WITHDRAW", price,
+        &env,
+        &client,
+        &token_id,
+        &admin,
+        &instructor,
+        "COURSE-FEE-WITHDRAW",
+        price,
     );
 
     // Token behaves normally at enrollment...
@@ -12548,7 +12666,15 @@ fn test_registry_lists_each_instructor_once() {
         "REG-B",
         100_000_000,
     );
-    register_and_approve_course(&env, &client, &token_id, &admin, &other, "REG-C", 100_000_000);
+    register_and_approve_course(
+        &env,
+        &client,
+        &token_id,
+        &admin,
+        &other,
+        "REG-C",
+        100_000_000,
+    );
 
     let registry = client.get_all_instructors(&admin);
     assert_eq!(registry.len(), 2);
@@ -12623,11 +12749,9 @@ fn test_pre_upgrade_instructor_is_not_relisted_without_lookup_key() {
 
     // Simulate a contract deployed before InstructorRegisteredKey existed.
     env.as_contract(&contract_id, || {
-        env.storage()
-            .persistent()
-            .remove(&InstructorRegisteredKey {
-                instructor: instructor.clone(),
-            });
+        env.storage().persistent().remove(&InstructorRegisteredKey {
+            instructor: instructor.clone(),
+        });
     });
 
     register_and_approve_course(
@@ -12743,7 +12867,9 @@ fn test_issue245_re_enroll_preserves_history_two_attempts() {
     assert!(history.get(0).unwrap().completed);
     assert!(history.get(1).unwrap().completed);
 
-    let enrollment = client.get_enrollment(&student, &student, &course_id).unwrap();
+    let enrollment = client
+        .get_enrollment(&student, &student, &course_id)
+        .unwrap();
     assert!(!enrollment.completed);
     assert_eq!(enrollment.amount_paid, price);
 }
@@ -13018,7 +13144,12 @@ fn test_issue239_get_certificate_third_party_rejected() {
     );
     let course_id = String::from_str(&env, "CERT-ISSUE239");
     client.enroll(&student, &course_id);
-    client.mark_completed(&admin, &student, &course_id, &Some(String::from_str(&env, "evidence")));
+    client.mark_completed(
+        &admin,
+        &student,
+        &course_id,
+        &Some(String::from_str(&env, "evidence")),
+    );
     let cert_id = String::from_str(&env, "CERT239");
     client.issue_certificate(
         &admin,
@@ -13052,7 +13183,12 @@ fn test_issue250_challenge_revocation_timing() {
     );
     let course_id = String::from_str(&env, "CERT-ISSUE250");
     client.enroll(&student, &course_id);
-    client.mark_completed(&admin, &student, &course_id, &Some(String::from_str(&env, "evidence")));
+    client.mark_completed(
+        &admin,
+        &student,
+        &course_id,
+        &Some(String::from_str(&env, "evidence")),
+    );
     let cert_id = String::from_str(&env, "CERT250");
     client.issue_certificate(
         &admin,
@@ -13089,7 +13225,12 @@ fn test_issue250_challenge_revocation_after_deadline() {
     );
     let course_id = String::from_str(&env, "CERT-ISSUE250B");
     client.enroll(&student, &course_id);
-    client.mark_completed(&admin, &student, &course_id, &Some(String::from_str(&env, "evidence")));
+    client.mark_completed(
+        &admin,
+        &student,
+        &course_id,
+        &Some(String::from_str(&env, "evidence")),
+    );
     let cert_id = String::from_str(&env, "CERT250B");
     client.issue_certificate(
         &admin,
@@ -13130,8 +13271,18 @@ fn test_issue251_bulk_revoke_counts() {
     let course_id = String::from_str(&env, "COURSE-251");
     client.enroll(&student1, &course_id);
     client.enroll(&student2, &course_id);
-    client.mark_completed(&admin, &student1, &course_id, &Some(String::from_str(&env, "e1")));
-    client.mark_completed(&admin, &student2, &course_id, &Some(String::from_str(&env, "e2")));
+    client.mark_completed(
+        &admin,
+        &student1,
+        &course_id,
+        &Some(String::from_str(&env, "e1")),
+    );
+    client.mark_completed(
+        &admin,
+        &student2,
+        &course_id,
+        &Some(String::from_str(&env, "e2")),
+    );
     let cert1 = String::from_str(&env, "CERT251-1");
     let cert2 = String::from_str(&env, "CERT251-2");
     client.issue_certificate(
@@ -13255,11 +13406,7 @@ fn test_issue249_prerequisites() {
     );
     let mut prereqs = soroban_sdk::Vec::new(&env);
     prereqs.push_back(String::from_str(&env, "PREREQ-BASE"));
-    client.set_prerequisite_courses(
-        &instructor,
-        &String::from_str(&env, "PREREQ-ADV"),
-        &prereqs,
-    );
+    client.set_prerequisite_courses(&instructor, &String::from_str(&env, "PREREQ-ADV"), &prereqs);
 
     // Should fail - no cert
     let res = client.try_enroll(&student, &String::from_str(&env, "PREREQ-ADV"));
@@ -13384,7 +13531,9 @@ fn test_issue242_freeze_pauses_active_courses() {
         100_000_000,
     );
     client.freeze_instructor(&admin, &instructor);
-    let course = client.get_course(&String::from_str(&env, "FREEZE-PAUSE")).unwrap();
+    let course = client
+        .get_course(&String::from_str(&env, "FREEZE-PAUSE"))
+        .unwrap();
     assert_eq!(course.status, CourseStatus::Paused);
 }
 
