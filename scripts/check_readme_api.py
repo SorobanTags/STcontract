@@ -21,7 +21,7 @@ ROOT = Path(__file__).resolve().parent.parent
 LIB_RS = ROOT / "contracts" / "sorobanlard" / "src" / "lib.rs"
 README = ROOT / "README.md"
 
-PUB_FN_RE = re.compile(r"^    pub fn ([a-z_][a-z0-9_]*)\(")
+PUB_FN_RE = re.compile(r"^    pub fn ([a-z_][a-z0-9_]*)")
 
 
 def public_functions(source):
@@ -38,9 +38,17 @@ def public_functions(source):
         name = match.group(1)
         header = []
         cursor = index
-        while True:
+        depth = 0
+        seen_open = False
+        while cursor < len(lines):
             header.append(lines[cursor])
-            if lines[cursor].rstrip().endswith("{"):
+            for char in lines[cursor]:
+                if char == "(":
+                    depth += 1
+                    seen_open = True
+                elif char == ")":
+                    depth -= 1
+            if seen_open and depth <= 0:
                 break
             cursor += 1
         signature = " ".join(header)
