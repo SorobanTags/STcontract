@@ -2400,6 +2400,22 @@ impl SorobanLardContract {
         }
     }
 
+    /// Atomically enroll a student in a named bundle of courses.
+    ///
+    /// This is the bundle-oriented entry point for `batch_enroll()`: every
+    /// guard is checked up front and either all courses are enrolled or none
+    /// are. A single `bundle_enrolled` event is emitted after the whole batch
+    /// succeeds so indexers can reconstruct the bundle without stitching
+    /// together individual `student_enrolled` events. (#122)
+    pub fn bundle_enroll(env: Env, student: Address, course_ids: Vec<String>) {
+        let count = course_ids.len();
+        Self::batch_enroll(env.clone(), student.clone(), course_ids);
+        env.events().publish(
+            (Symbol::new(&env, "bundle_enrolled"), student.clone()),
+            (student, count, env.ledger().sequence()),
+        );
+    }
+
     /// Run every enrollment guard for `student` in `course_id` and return the
     /// Course that was checked, so callers can reuse it without another read.
     fn validate_enrollment(env: &Env, student: &Address, course_id: &String) -> Course {
