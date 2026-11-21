@@ -198,7 +198,7 @@ jobs:
     name: Property-based tests (accounting fuzzing)
     runs-on: ubuntu-latest
     env:
-      PROPTEST_CASES: 256
+      PROPTEST_CASES: 1024
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -206,4 +206,4 @@ jobs:
           toolchain: stable
       - uses: Swatinem/rust-cache@v2
       - name: Run property-based accounting tests
-        run: cargo test --workspace proptests
+        run: PROPTEST_CASES=1024 cargo test -p sorobanlard proptests
