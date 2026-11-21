@@ -3131,6 +3131,34 @@ fn test_zero_balance_withdrawal_is_safe() {
 }
 
 #[test]
+fn test_withdraw_earnings_zero_balance_panics_and_preserves_balance() {
+    let (env, contract_id, token_id, _admin, _sec_admin, _treasury, instructor) = setup();
+    let client = SorobanLardContractClient::new(&env, &contract_id);
+    let token_client = token::Client::new(&env, &token_id);
+
+    let balance_before = token_client.balance(&instructor);
+    assert_eq!(client.get_instructor_earnings(&instructor, &token_id), 0);
+
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        client.withdraw_earnings(&instructor, &token_id, &100);
+    }));
+    let err = result.expect_err("withdraw_earnings should panic when credited balance is zero");
+    let msg = if let Some(s) = err.downcast_ref::<&str>() {
+        std::string::String::from(*s)
+    } else if let Some(s) = err.downcast_ref::<std::string::String>() {
+        s.clone()
+    } else {
+        std::string::String::new()
+    };
+    assert!(
+        msg.contains("insufficient earnings balance"),
+        "unexpected panic message: {msg}"
+    );
+    assert_eq!(token_client.balance(&instructor), balance_before);
+    assert_eq!(client.get_instructor_earnings(&instructor, &token_id), 0);
+}
+
+#[test]
 #[should_panic(expected = "instructor has reached the maximum number of course registrations")]
 fn test_registration_limit_enforced() {
     let (env, contract_id, token_id, admin, _sec_admin, _treasury, instructor) = setup();
