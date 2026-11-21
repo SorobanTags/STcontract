@@ -153,6 +153,35 @@ proptest! {
         }
     }
 
+    /// For every generated `(amount, bps, override_bps)` with `amount >= 0`,
+    /// neither the platform fee nor the instructor share ever exceeds `amount`,
+    /// and the two shares always sum to `amount`.
+    #[test]
+    fn prop_deduct_fee_shares_never_exceed_amount(
+        amount in prop_oneof![
+            1 => Just(0i128),
+            1 => Just(1i128),
+            1 => Just(i128::MAX / 10_000),
+            7 => 0i128..=(i128::MAX / 10_000),
+        ],
+        bps in fee_bps(),
+        override_bps in proptest::option::of(0u32..=10_000),
+    ) {
+        let (env, contract_id, token_id, admin, _sec_admin, _treasury, _instructor) = setup();
+        let client = SorobanLardContractClient::new(&env, &contract_id);
+        client.set_fee_config(&admin, &token_id, &bps);
+
+        let (instructor, platform) = env.as_contract(&contract_id, || {
+            SorobanLardContract::deduct_fee(&env, &token_id, amount, override_bps, false, false)
+        });
+
+        prop_assert!(platform >= 0);
+        prop_assert!(instructor >= 0);
+        prop_assert!(platform <= amount);
+        prop_assert!(instructor <= amount);
+        prop_assert_eq!(platform + instructor, amount);
+    }
+
     /// When `amount * fee_bps` cannot be represented in an i128 the fee
     /// computation must panic rather than silently wrap.
     #[test]
