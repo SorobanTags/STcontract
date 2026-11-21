@@ -1010,6 +1010,54 @@ impl SorobanLardContract {
             .set(&DataKey::InitLedger, &env.ledger().sequence());
     }
 
+    /// Read-only mainnet preflight for the privileged addresses and approved
+    /// token list used by `init()`. It applies the same separation and
+    /// contract-address checks as initialization, then verifies every token
+    /// implements the expected token interface. Nothing is written to storage.
+    /// Returns `true` when every check passes. (#130)
+    pub fn mainnet_init_preflight(
+        env: Env,
+        admin: Address,
+        secondary_admin: Address,
+        treasury: Address,
+        tokens: Vec<Address>,
+    ) -> bool {
+        if env.storage().instance().has(&DataKey::Admin) {
+            panic!("contract already initialized");
+        }
+
+        let contract_address = env.current_contract_address();
+        if admin == contract_address {
+            panic!("admin cannot be the contract address");
+        }
+        if secondary_admin == contract_address {
+            panic!("secondary_admin cannot be the contract address");
+        }
+        if treasury == contract_address {
+            panic!("treasury cannot be the contract address");
+        }
+        if admin == secondary_admin || admin == treasury || secondary_admin == treasury {
+            panic!("privileged addresses must be distinct");
+        }
+
+        if tokens.is_empty() {
+            panic!("at least one approved token is required");
+        }
+        for i in 0..tokens.len() {
+            let token = tokens.get(i).unwrap();
+            if token == contract_address {
+                panic!("token cannot be the contract address");
+            }
+            for j in 0..i {
+                if tokens.get(j).unwrap() == token {
+                    panic!("duplicate approved token");
+                }
+            }
+            Self::validate_token_interface(&env, &token);
+        }
+        true
+    }
+
     /// Instructor or admin configures an optional ledger sequence when enrollment opens.
     ///
     /// Set to `None` to allow enrollment immediately after the course becomes Active.
