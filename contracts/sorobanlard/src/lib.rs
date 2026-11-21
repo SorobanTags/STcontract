@@ -2344,6 +2344,44 @@ impl SorobanLardContract {
         Self::enroll_internal(&env, &student, &course_id);
     }
 
+    /// Record a discount redemption for off-chain reconciliation.
+    ///
+    /// The discount is validated against the same 50% cap as enrollment
+    /// discounts and the course must exist. This function only emits the
+    /// `discount_redeemed` event — it does not move funds or mutate storage,
+    /// so backends can correlate the redemption code with the subsequent
+    /// enrollment transaction. (#118)
+    pub fn redeem_discount(
+        env: Env,
+        student: Address,
+        course_id: String,
+        discount_bps: u32,
+        redemption_code: String,
+    ) {
+        student.require_auth();
+        if discount_bps > 5_000 {
+            panic!("discount exceeds maximum 5000 bps");
+        }
+        let course = Self::get_course_internal(&env, &course_id)
+            .unwrap_or_else(|| panic!("course not found"));
+        let discount_amount = course
+            .price
+            .checked_mul(discount_bps as i128)
+            .unwrap_or_else(|| panic!("discount amount overflow"))
+            / 10_000i128;
+        env.events().publish(
+            (Symbol::new(&env, "discount_redeemed"), course_id.clone()),
+            (
+                student.clone(),
+                course_id,
+                discount_bps,
+                discount_amount,
+                redemption_code,
+                env.ledger().sequence(),
+            ),
+        );
+    }
+
     /// Enroll a student in multiple courses atomically.
     /// The entire batch succeeds or the entire batch fails — no partial state.
     ///
