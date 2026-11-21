@@ -448,6 +448,15 @@ pub struct Course {
     pub categories: Vec<String>,
 }
 
+/// Read-only quote for a bundle of courses (#126).
+#[contracttype]
+#[derive(Clone)]
+pub struct BundleQuote {
+    pub course_ids: Vec<String>,
+    pub token: Address,
+    pub total_price: i128,
+}
+
 /// An enrollment record — one per student per course
 #[contracttype]
 #[derive(Clone)]
@@ -2397,6 +2406,55 @@ impl SorobanLardContract {
             let course_id = course_ids.get(i).unwrap();
             let course = validated.get(i).unwrap();
             Self::enroll_internal_validated(&env, &student, &course_id, course);
+        }
+    }
+
+    /// Return the contents and total price of a course bundle without
+    /// mutating any state. The same guards as `batch_enroll()` are applied:
+    /// non-empty, at most `MAX_BATCH_SIZE` entries, no duplicates and every
+    /// course must exist. All courses must share one token so the returned
+    /// price can be paid in a single transfer. (#126)
+    pub fn get_bundle_quote(env: Env, course_ids: Vec<String>) -> BundleQuote {
+        if course_ids.is_empty() {
+            panic!("course list cannot be empty");
+        }
+        if course_ids.len() > Self::MAX_BATCH_SIZE {
+            panic!(
+                "bundle size {} exceeds maximum allowed {}",
+                course_ids.len(),
+                Self::MAX_BATCH_SIZE
+            );
+        }
+
+        let mut seen: Map<String, bool> = Map::new(&env);
+        let mut token: Option<Address> = None;
+        let mut total_price: i128 = 0;
+
+        for i in 0..course_ids.len() {
+            let course_id = course_ids.get(i).unwrap();
+            if seen.contains_key(course_id.clone()) {
+                panic!("duplicate course in bundle");
+            }
+            seen.set(course_id.clone(), true);
+
+            let course = Self::get_course_internal(&env, &course_id)
+                .unwrap_or_else(|| panic!("course not found"));
+            match &token {
+                Some(existing) if existing != &course.token => {
+                    panic!("bundle courses must share a token")
+                }
+                None => token = Some(course.token.clone()),
+                _ => {}
+            }
+            total_price = total_price
+                .checked_add(course.price)
+                .unwrap_or_else(|| panic!("bundle price overflow"));
+        }
+
+        BundleQuote {
+            course_ids,
+            token: token.unwrap(),
+            total_price,
         }
     }
 
