@@ -449,6 +449,8 @@ cargo test -- --nocapture          # with output
 cargo test test_full_lifecycle     # single test
 ```
 
+See [docs/running-tests.md](docs/running-tests.md) for package-scoped commands, running one test by name, and test-output options.
+
 Expected:
 ```
 running 14 tests
@@ -497,6 +499,8 @@ make optimize   # → target/wasm32v1-none/release/sorobanlard.optimized.wasm
 ---
 
 ## Deploying to Testnet
+
+Check required variables first with `./scripts/preflight-env.sh deploy` (see [docs/deployment-preflight.md](docs/deployment-preflight.md)). If funding or identity setup fails, see [docs/testnet-account-troubleshooting.md](docs/testnet-account-troubleshooting.md).
 
 ```bash
 export STELLAR_ACCOUNT=my-account
@@ -556,7 +560,9 @@ export STUDENT_ACCOUNT=student-account
 ./scripts/smoke-test-testnet.sh
 ```
 
-Exit codes: `0` if every step succeeded and `verify_certificate` returned `true`; `1` on a missing environment variable or missing `stellar` CLI; `2` if any contract call failed (the failing step is printed).
+Exit codes: `0` if every step succeeded and `verify_certificate` returned `true`; `1` on a missing environment variable or missing `stellar` CLI; `2` if any contract call failed (the failing step is printed); `3` if records for this run's IDs already exist (nothing is changed).
+
+**Rerunning is safe.** Each run uses a collision-resistant `SMOKE_RUN_ID` (`<unix time>-<random hex>`), so it creates a new free course and certificate rather than touching earlier ones. A read-only pre-check (`get_course`, `verify_certificate`) runs before any write; if `SMOKE_RUN_ID` is set to a value that was already used, the script exits `3` without submitting transactions. Only price-0 courses are used, so no paid-token transfers occur.
 
 ### Register and approve a test course
 
