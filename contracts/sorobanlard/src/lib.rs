@@ -562,6 +562,27 @@ pub struct RefundRequest {
     pub status: RefundStatus,
 }
 
+/// Result of a single paginated bulk-revocation call.
+///
+/// `bulk_revoke_certificates_paged` processes a bounded slice of a
+/// course's certificate index per call. The cursor advances monotonically, so
+/// repeated calls make forward progress without skipping or double-counting
+/// certificates. Because `apply_revocation` is idempotent (already-revoked
+/// certificates return `false`), a page that is retried after a failure simply
+/// re-confirms the prior revocations and continues.
+#[contracttype]
+#[derive(Clone)]
+pub struct BulkRevokePage {
+    /// Number of certificates newly marked for revocation in this page.
+    pub revoked_count: u32,
+    /// Number of index entries examined in this page (including
+    /// already-revoked certificates that were skipped).
+    pub processed: u32,
+    /// Cursor for the next page, or `None` when every index entry has been
+    /// examined. Pass this value as the next call's `cursor`.
+    pub next_cursor: Option<u32>,
+}
+
 /// Aggregate on-chain reputation stats for an instructor, accumulated
 /// across all of their courses. Gives students an on-chain signal of an
 /// instructor's track record without relying on off-chain review systems.
@@ -3814,6 +3835,98 @@ impl SorobanLardContract {
         );
 
         true
+    }
+
+    /// Admin revokes certificates for a course one bounded page at a time.
+    ///
+    /// This is the paginated counterpart of `bulk_revoke_course_certificates`.
+    /// Instead of loading and processing the entire `CourseCertificates` index
+    /// in a single transaction — which can exceed resource limits for large
+    /// uncapped courses — the caller supplies a zero-based `cursor` and a
+    /// `limit`. Only the slice `[cursor, cursor + limit)` is examined.
+    ///
+    /// `apply_revocation` is idempotent: an already-revoked certificate is
+    /// skipped (returns `false`), so re-invoking the same page after a failure
+    /// is safe — it re-confirms the prior revocations and moves on. The
+    /// returned `next_cursor` advances monotonically, ensuring repeated calls
+    /// make forward progress without skipping or double-counting certificates.
+    ///
+    /// # Arguments
+    /// - `admin`     — must match stored admin
+    /// - `course_id` — the course whose certificates are being revoked
+    /// - `cursor`    — zero-based index of the first certificate ID to process
+    /// - `limit`     — maximum number of certificates to process; values above
+    ///                  `MAX_PAGE_SIZE` are clamped to that bound
+    ///
+    /// # Returns
+    /// A [`BulkRevokePage`] with the number newly revoked, the number
+    /// examined, and the cursor for the next page (`None` when finished).
+    ///
+    /// # Panics
+    /// - `unauthorized` if `admin` is not the stored admin.
+    /// - `course not found` if the course does not exist.
+    pub fn bulk_revoke_certificates_paged(
+        env: Env,
+        admin: Address,
+        course_id: String,
+        cursor: u32,
+        limit: u32,
+    ) -> BulkRevokePage {
+        admin.require_auth();
+        Self::require_admin(&env, &admin, "bulk_revoke_certificates_paged");
+        env.storage()
+            .instance()
+            .extend_ttl(Self::INSTANCE_TTL_THRESHOLD, Self::INSTANCE_TTL_EXTEND_TO);
+
+        if Self::get_course_internal(&env, &course_id).is_none() {
+            panic!("course not found");
+        }
+
+        let certificate_ids: Vec<String> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::CourseCertificates(course_id.clone()))
+            .unwrap_or_else(|| Vec::new(&env));
+
+        let total = certificate_ids.len();
+
+        // A cursor past the end is a no-op page; returning an empty result
+        // lets a caller poll completion without special-casing the tail.
+        let start = cursor.min(total);
+        let page_limit = limit.min(Self::MAX_PAGE_SIZE);
+        let end = start.saturating_add(page_limit).min(total);
+
+        let reason = String::from_str(&env, "BULK_COURSE_REVOCATION");
+        let mut revoked_count: u32 = 0;
+        let mut processed: u32 = 0;
+
+        for i in start..end {
+            let certificate_id = certificate_ids.get(i).unwrap();
+            if Self::apply_revocation(&env, &admin, &certificate_id, &reason) {
+                revoked_count = revoked_count
+                    .checked_add(1)
+                    .unwrap_or_else(|| panic!("revoked certificate count overflow"));
+            }
+            processed = processed
+                .checked_add(1)
+                .unwrap_or_else(|| panic!("processed count overflow"));
+        }
+
+        let next_cursor = if end < total { Some(end) } else { None };
+
+        env.events().publish(
+            (
+                Symbol::new(&env, "course_certificates_revoked"),
+                course_id.clone(),
+            ),
+            (admin, course_id, revoked_count, env.ledger().sequence()),
+        );
+
+        BulkRevokePage {
+            revoked_count,
+            processed,
+            next_cursor,
+        }
     }
 
     /// Student challenges a pending certificate revocation.

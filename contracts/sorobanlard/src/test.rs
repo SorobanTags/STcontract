@@ -10210,6 +10210,232 @@ fn test_bulk_revoke_emits_course_certificates_revoked_event() {
     assert_eq!(event_ledger, env.ledger().sequence());
 }
 
+// ============================================================
+// PAGINATED BULK REVOCATION (#87)
+// ============================================================
+
+#[test]
+fn test_paginated_bulk_revoke_progresses_through_pages() {
+    let (env, contract_id, token_id, admin, _sec_admin, _treasury, instructor) = setup();
+    let client = SorobanLardContractClient::new(&env, &contract_id);
+
+    register_and_approve_course(
+        &env,
+        &client,
+        &token_id,
+        &admin,
+        &instructor,
+        "COURSE-PAG-PROGRESS",
+        100_000_000,
+    );
+    let course_id = String::from_str(&env, "COURSE-PAG-PROGRESS");
+    let cert_names = [
+        "CERT-PAG-0",
+        "CERT-PAG-1",
+        "CERT-PAG-2",
+        "CERT-PAG-3",
+        "CERT-PAG-4",
+    ];
+    for cert_name in cert_names {
+        let student = Address::generate(&env);
+        enroll_and_certify(
+            &env,
+            &client,
+            &token_id,
+            &admin,
+            &student,
+            "COURSE-PAG-PROGRESS",
+            cert_name,
+        );
+    }
+    assert_eq!(client.get_course_certificates(&course_id).len(), 5);
+
+    // Page 1: cursor=0, limit=2 → revoke 2, advance to cursor=2
+    let page = client.bulk_revoke_certificates_paged(&admin, &course_id, &0u32, &2u32);
+    assert_eq!(page.revoked_count, 2);
+    assert_eq!(page.processed, 2);
+    assert_eq!(page.next_cursor, Some(2));
+
+    // Page 2: cursor=2, limit=2 → revoke 2, advance to cursor=4
+    let page = client.bulk_revoke_certificates_paged(&admin, &course_id, &2u32, &2u32);
+    assert_eq!(page.revoked_count, 2);
+    assert_eq!(page.processed, 2);
+    assert_eq!(page.next_cursor, Some(4));
+
+    // Page 3: cursor=4, limit=2 → revoke 1 (only one left), done
+    let page = client.bulk_revoke_certificates_paged(&admin, &course_id, &4u32, &2u32);
+    assert_eq!(page.revoked_count, 1);
+    assert_eq!(page.processed, 1);
+    assert_eq!(page.next_cursor, None);
+
+    // Every certificate is revoked — no skips.
+    for cert_name in cert_names {
+        let cert = client.get_certificate(&admin, &String::from_str(&env, cert_name));
+        assert!(cert.revoked, "{} should be revoked", cert_name);
+    }
+}
+
+#[test]
+fn test_paginated_bulk_revoke_resume_is_idempotent() {
+    let (env, contract_id, token_id, admin, _sec_admin, _treasury, instructor) = setup();
+    let client = SorobanLardContractClient::new(&env, &contract_id);
+
+    register_and_approve_course(
+        &env,
+        &client,
+        &token_id,
+        &admin,
+        &instructor,
+        "COURSE-PAG-RESUME",
+        100_000_000,
+    );
+    let course_id = String::from_str(&env, "COURSE-PAG-RESUME");
+    let cert_names = ["CERT-RES-0", "CERT-RES-1", "CERT-RES-2", "CERT-RES-3"];
+    for cert_name in cert_names {
+        let student = Address::generate(&env);
+        enroll_and_certify(
+            &env,
+            &client,
+            &token_id,
+            &admin,
+            &student,
+            "COURSE-PAG-RESUME",
+            cert_name,
+        );
+    }
+
+    // Page 1 succeeds: revokes 2, advances cursor to 2.
+    let page = client.bulk_revoke_certificates_paged(&admin, &course_id, &0u32, &2u32);
+    assert_eq!(page.revoked_count, 2);
+    assert_eq!(page.next_cursor, Some(2));
+
+    // Simulate a retry of page 1 (the caller's cursor did not advance
+    // because the previous call "failed"). The already-revoked
+    // certificates are skipped — no double count.
+    let page = client.bulk_revoke_certificates_paged(&admin, &course_id, &0u32, &2u32);
+    assert_eq!(page.revoked_count, 0);
+    assert_eq!(page.processed, 2);
+    assert_eq!(page.next_cursor, Some(2));
+
+    // Resume from cursor=2: the remaining live certificates are processed.
+    let page = client.bulk_revoke_certificates_paged(&admin, &course_id, &2u32, &2u32);
+    assert_eq!(page.revoked_count, 2);
+    assert_eq!(page.processed, 2);
+    assert_eq!(page.next_cursor, None);
+
+    for cert_name in cert_names {
+        let cert = client.get_certificate(&admin, &String::from_str(&env, cert_name));
+        assert!(cert.revoked, "{} should be revoked", cert_name);
+    }
+}
+
+#[test]
+fn test_paginated_bulk_revoke_cursor_past_end_is_noop() {
+    let (env, contract_id, token_id, admin, _sec_admin, _treasury, instructor) = setup();
+    let client = SorobanLardContractClient::new(&env, &contract_id);
+
+    register_and_approve_course(
+        &env,
+        &client,
+        &token_id,
+        &admin,
+        &instructor,
+        "COURSE-PAG-NOOP",
+        100_000_000,
+    );
+    let course_id = String::from_str(&env, "COURSE-PAG-NOOP");
+    let student = Address::generate(&env);
+    enroll_and_certify(
+        &env,
+        &client,
+        &token_id,
+        &admin,
+        &student,
+        "COURSE-PAG-NOOP",
+        "CERT-NOOP-0",
+    );
+
+    // Cursor beyond the index is an empty page with next_cursor=None.
+    let page = client.bulk_revoke_certificates_paged(&admin, &course_id, &10u32, &5u32);
+    assert_eq!(page.revoked_count, 0);
+    assert_eq!(page.processed, 0);
+    assert_eq!(page.next_cursor, None);
+
+    // The live certificate is untouched.
+    assert!(client.verify_certificate(&String::from_str(&env, "CERT-NOOP-0")));
+}
+
+#[test]
+fn test_paginated_bulk_revoke_clamps_limit() {
+    let (env, contract_id, token_id, admin, _sec_admin, _treasury, instructor) = setup();
+    let client = SorobanLardContractClient::new(&env, &contract_id);
+
+    register_and_approve_course(
+        &env,
+        &client,
+        &token_id,
+        &admin,
+        &instructor,
+        "COURSE-PAG-CLAMP",
+        100_000_000,
+    );
+    let course_id = String::from_str(&env, "COURSE-PAG-CLAMP");
+
+    // Issue more than MAX_PAGE_SIZE certificates via direct storage so the
+    // test does not pay the full enroll/complete/issue cost 55 times.
+    let total = SorobanLardContract::MAX_PAGE_SIZE + 5;
+    env.as_contract(&contract_id, || {
+        let mut certificate_ids = soroban_sdk::Vec::new(&env);
+        for index in 0..total {
+            let certificate_id = String::from_str(&env, &format!("CERT-CLAMP-{index}"));
+            let certificate = Certificate {
+                id: certificate_id.clone(),
+                student: Address::generate(&env),
+                course_id: course_id.clone(),
+                course_title: String::from_str(&env, "Paginated clamp course"),
+                enrollment_reference: String::from_str(&env, "clamp-enrollment"),
+                instructor: instructor.clone(),
+                issued_by: contract_id.clone(),
+                issued_at_ledger: env.ledger().sequence(),
+                revoked: false,
+                revoked_by: None,
+                revocation_ledger: None,
+                revocation_reason: None,
+                expires_at_ledger: None,
+                instructor_signature: None,
+                revocation_deadline: None,
+            };
+            env.storage()
+                .persistent()
+                .set(&DataKey::Certificate(certificate_id.clone()), &certificate);
+            certificate_ids.push_back(certificate_id);
+        }
+        env.storage().persistent().set(
+            &DataKey::CourseCertificates(course_id.clone()),
+            &certificate_ids,
+        );
+    });
+
+    assert_eq!(client.get_course_certificates(&course_id).len(), total);
+
+    // An oversized limit is clamped to MAX_PAGE_SIZE.
+    let page = client.bulk_revoke_certificates_paged(&admin, &course_id, &0u32, &u32::MAX);
+    assert_eq!(page.processed, SorobanLardContract::MAX_PAGE_SIZE);
+    assert_eq!(page.revoked_count, SorobanLardContract::MAX_PAGE_SIZE);
+    assert_eq!(page.next_cursor, Some(SorobanLardContract::MAX_PAGE_SIZE));
+
+    // The remainder fits in one more page.
+    let page = client.bulk_revoke_certificates_paged(
+        &admin,
+        &course_id,
+        &SorobanLardContract::MAX_PAGE_SIZE,
+        &u32::MAX,
+    );
+    assert_eq!(page.processed, 5);
+    assert_eq!(page.revoked_count, 5);
+    assert_eq!(page.next_cursor, None);
+}
+
 #[test]
 fn test_bulk_revoked_certificate_can_still_be_challenged_and_re_revoked() {
     let (env, contract_id, token_id, admin, _sec_admin, _treasury, instructor) = setup();
