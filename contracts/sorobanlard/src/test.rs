@@ -14144,3 +14144,248 @@ fn test_current_wasm_hash_none_before_first_upgrade() {
 
     assert_eq!(client.get_current_wasm_hash(), None);
 }
+
+// ============================================================
+// ENROLLMENT / REFUND REGRESSION TESTS (#63, #64, #65, #66)
+// ============================================================
+
+/// Shared fixture for the enrollment/refund regression tests below: a funded
+/// student and an approved course with a 10-ledger refund window.
+fn setup_refund_course(
+    course: &str,
+    price: i128,
+) -> (
+    Env,
+    SorobanLardContractClient<'static>,
+    Address,
+    Address,
+    Address,
+    String,
+) {
+    let (env, contract_id, token_id, admin, _sec_admin, _treasury, instructor) = setup();
+    let client = SorobanLardContractClient::new(&env, &contract_id);
+
+    let student = Address::generate(&env);
+    token::StellarAssetClient::new(&env, &token_id).mint(&student, &10_000_000_000);
+
+    register_and_approve_course(&env, &client, &token_id, &admin, &instructor, course, price);
+    client.update_refund_window(&admin, &10u32);
+
+    let course_id = String::from_str(&env, course);
+    (env, client, token_id, admin, student, course_id)
+}
+
+// --- #63: course paused before the enrollment invocation ---
+
+#[test]
+fn test_issue63_enroll_rejected_when_course_paused_before_submission() {
+    let (env, client, token_id, _admin, student, course_id) =
+        setup_refund_course("COURSE-63", 500_000_000);
+    let token_client = token::Client::new(&env, &token_id);
+    let instructor = client.get_course(&course_id).unwrap().instructor;
+
+    // Snapshot everything the enrollment would touch while the course is Active.
+    let student_balance = token_client.balance(&student);
+    let contract_balance = token_client.balance(&client.address);
+    let earnings = client.get_instructor_earnings(&instructor, &token_id);
+    let total_active = client.get_total_active_enrollments();
+    let enrollment_count = client.get_student_enrollment_count(&student);
+    let course_before = client.get_course(&course_id).unwrap();
+
+    // The pause lands on-chain in an earlier ledger than the enroll
+    // submission, so enroll() must read the live status, not a stale one.
+    client.pause_course(&instructor, &course_id);
+    env.ledger().with_mut(|l| l.sequence_number += 1);
+
+    let result = client.try_enroll(&student, &course_id);
+    assert!(result.is_err(), "enrollment into a paused course must fail");
+
+    let course_after = client.get_course(&course_id).unwrap();
+    assert_eq!(course_after.status, CourseStatus::Paused);
+    assert_eq!(
+        course_after.total_enrollments,
+        course_before.total_enrollments
+    );
+    assert_eq!(
+        course_after.active_enrollments,
+        course_before.active_enrollments
+    );
+    assert_eq!(token_client.balance(&student), student_balance);
+    assert_eq!(token_client.balance(&client.address), contract_balance);
+    assert_eq!(
+        client.get_instructor_earnings(&instructor, &token_id),
+        earnings
+    );
+    assert_eq!(client.get_total_active_enrollments(), total_active);
+    assert_eq!(
+        client.get_student_enrollment_count(&student),
+        enrollment_count
+    );
+    assert!(!client.is_enrolled(&student, &course_id));
+    assert!(client
+        .get_enrollment(&student, &student, &course_id)
+        .is_none());
+    assert_eq!(
+        client
+            .get_enrollment_history(&student, &student, &course_id)
+            .len(),
+        0
+    );
+
+    // Once unpaused the same student can enroll normally.
+    client.unpause_course(&instructor, &course_id);
+    client.enroll(&student, &course_id);
+    assert!(client.is_enrolled(&student, &course_id));
+}
+
+// --- #64: re-enrollment after a refunded attempt ---
+
+#[test]
+fn test_issue64_re_enroll_after_refunded_attempt() {
+    let price: i128 = 500_000_000;
+    let (env, client, token_id, admin, student, course_id) =
+        setup_refund_course("COURSE-64", price);
+    let token_client = token::Client::new(&env, &token_id);
+
+    client.enroll(&student, &course_id);
+    let first = client
+        .get_enrollment(&student, &student, &course_id)
+        .unwrap();
+
+    client.request_refund(&student, &course_id);
+    env.mock_all_auths_allowing_non_root_auth();
+    client.process_refund(&admin, &student, &course_id, &true);
+    assert!(!client.is_enrolled(&student, &course_id));
+
+    // A refunded attempt removes the active record, so the permitted path
+    // back into the course is a fresh enroll() in a later ledger.
+    env.ledger().with_mut(|l| l.sequence_number += 5);
+    let balance_before = token_client.balance(&student);
+    client.enroll(&student, &course_id);
+    assert_eq!(balance_before - token_client.balance(&student), price);
+
+    let history = client.get_enrollment_history(&student, &student, &course_id);
+    assert_eq!(history.len(), 1);
+    let archived = history.get(0).unwrap();
+    assert!(archived.is_refunded);
+    assert_eq!(archived.enrollment_ref, first.enrollment_ref);
+    assert_eq!(archived.enrolled_at_ledger, first.enrolled_at_ledger);
+    assert_eq!(archived.amount_paid, price);
+
+    let second = client
+        .get_enrollment(&student, &student, &course_id)
+        .unwrap();
+    assert!(!second.is_refunded);
+    assert!(!second.completed);
+    assert!(!second.certificate_issued);
+    assert_eq!(second.certificate_id, None);
+    assert_eq!(second.evidence_hash, None);
+    assert_eq!(second.completed_at_ledger, None);
+    assert_eq!(second.amount_paid, price);
+    assert_eq!(second.platform_amount + second.instructor_amount, price);
+    assert_eq!(second.enrolled_at_ledger, env.ledger().sequence());
+    assert!(second.enrolled_at_ledger > first.enrolled_at_ledger);
+    assert_ne!(second.enrollment_ref, first.enrollment_ref);
+}
+
+// --- #65: history preserves ledger timestamps across retakes ---
+
+#[test]
+fn test_issue65_history_preserves_ledgers_across_retakes() {
+    let price: i128 = 500_000_000;
+    let (env, client, _token_id, admin, student, course_id) =
+        setup_refund_course("COURSE-65", price);
+
+    let mut expected: std::vec::Vec<(u32, u32, String)> = std::vec::Vec::new();
+    for (step, evidence) in [(3u32, "evidence_a"), (7, "evidence_b"), (11, "evidence_c")] {
+        env.ledger().with_mut(|l| l.sequence_number += step);
+        if expected.is_empty() {
+            client.enroll(&student, &course_id);
+        } else {
+            client.re_enroll(&student, &course_id);
+        }
+        let enrolled_at = env.ledger().sequence();
+
+        env.ledger().with_mut(|l| l.sequence_number += 2);
+        client.mark_completed(
+            &admin,
+            &student,
+            &course_id,
+            &Some(String::from_str(&env, evidence)),
+        );
+        expected.push((
+            enrolled_at,
+            env.ledger().sequence(),
+            String::from_str(&env, evidence),
+        ));
+    }
+
+    // Archive the third completed attempt by retaking once more.
+    env.ledger().with_mut(|l| l.sequence_number += 4);
+    client.re_enroll(&student, &course_id);
+
+    let history = client.get_enrollment_history(&student, &student, &course_id);
+    assert_eq!(history.len(), expected.len() as u32);
+    let mut previous_ledger = 0u32;
+    for (i, (enrolled_at, completed_at, evidence)) in expected.iter().enumerate() {
+        let entry = history.get(i as u32).unwrap();
+        assert!(
+            entry.enrolled_at_ledger > previous_ledger,
+            "history must be chronological"
+        );
+        previous_ledger = entry.enrolled_at_ledger;
+        assert_eq!(entry.enrolled_at_ledger, *enrolled_at);
+        assert_eq!(entry.completed_at_ledger, Some(*completed_at));
+        assert_eq!(entry.evidence_hash, Some(evidence.clone()));
+        assert_eq!(entry.amount_paid, price);
+        assert!(entry.completed);
+        assert!(!entry.is_refunded);
+    }
+
+    let current = client
+        .get_enrollment(&student, &student, &course_id)
+        .unwrap();
+    assert_eq!(current.enrolled_at_ledger, env.ledger().sequence());
+    assert!(!current.completed);
+    assert_eq!(current.completed_at_ledger, None);
+}
+
+// --- #66: refund window at the exact ledger boundary ---
+//
+// Boundary rule: a refund is accepted while
+// `current_ledger - enrolled_at_ledger < refund_window`, i.e. the last
+// eligible ledger is `enrolled_at_ledger + refund_window - 1`.
+
+/// Enrolls, jumps to `enrolled_at + offset`, and reports whether
+/// `request_refund` was accepted (10-ledger window).
+fn refund_accepted_at_offset(offset: u32) -> bool {
+    let (env, client, _token_id, _admin, student, course_id) =
+        setup_refund_course("COURSE-66", 500_000_000);
+    client.enroll(&student, &course_id);
+    let enrolled_at = env.ledger().sequence();
+    env.ledger()
+        .with_mut(|l| l.sequence_number = enrolled_at + offset);
+
+    let accepted = client.try_request_refund(&student, &course_id).is_ok();
+    assert_eq!(
+        accepted,
+        client.get_refund_request(&student, &course_id).is_some(),
+        "a rejected request must not persist a refund record"
+    );
+    accepted
+}
+
+#[test]
+fn test_issue66_refund_one_ledger_before_boundary_accepted() {
+    assert!(refund_accepted_at_offset(10 - 1));
+}
+
+#[test]
+fn test_issue66_refund_exactly_at_boundary_rejected() {
+    assert!(!refund_accepted_at_offset(10));
+}
+
+#[test]
+fn test_issue66_refund_one_ledger_after_boundary_rejected() {
+    assert!(!refund_accepted_at_offset(10 + 1));
+}

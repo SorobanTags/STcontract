@@ -530,7 +530,7 @@ stellar contract invoke \
 | `treasury` | A cold or multi-sig account that receives the platform fee | Must differ from `admin`, `secondary_admin`, and the contract address. |
 | `default_fee_pct` | `20` | Platform fee in percent (0–100), used when a course does not override it. Matches the testnet default. |
 | `max_courses_per_instructor` | `50` | Caps how many courses one instructor can register. Can be raised later with `update_max_courses_limit`. |
-| `refund_window_ledgers` | `17280` (about 1 day at 5 s per ledger) | Students can request a refund only within this many ledgers after enrolling. Use `120960` (about 7 days) for a more generous policy. |
+| `refund_window_ledgers` | `17280` (about 1 day at 5 s per ledger) | Students can request a refund only within this many ledgers after enrolling: a request is accepted while `ledger - enrolled_at_ledger < refund_window_ledgers`, so the last eligible ledger is `enrolled_at_ledger + refund_window_ledgers - 1`. Use `120960` (about 7 days) for a more generous policy. |
 | `revocation_challenge_period` | `17280` (about 1 day) | How long a student can challenge a certificate revocation before it becomes permanent. |
 
 #### Decisions to make before calling `init`
