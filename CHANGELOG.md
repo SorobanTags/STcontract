@@ -27,6 +27,17 @@ Convention:
 ### Added
 
 - CHANGELOG tracking contract version history and upgrade hashes.
+- Refund regression tests (#67): completed enrollments follow the documented
+  refund policy — completion cannot bypass refund eligibility rules via
+  `request_refund` or `archive_course`.
+- Refund rollback test (#68): `process_refund` reverts atomically when the
+  payout transfer fails — enrollment, earnings, pool balance, and refund
+  request status remain unchanged.
+- Refund event payload tests (#69): stable topic and payload schemas for
+  `refund_requested` and `refund_processed` (approved and rejected) for
+  off-chain indexer reconciliation.
+- Double-refund prevention test (#70): archived enrollment records cannot be
+  refunded twice via `process_refund` or `archive_course`.
 
 ## [0.1.0] - Initial tracked release
 

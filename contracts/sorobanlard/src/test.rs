@@ -14144,3 +14144,417 @@ fn test_current_wasm_hash_none_before_first_upgrade() {
 
     assert_eq!(client.get_current_wasm_hash(), None);
 }
+
+// ============================================================
+// REFUND REGRESSION TESTS (#67, #68, #69, #70)
+// ============================================================
+
+/// Find the most recent event emitted by `contract_id` whose first topic
+/// matches `name`. Returns `(topics, data)` so callers can assert both the
+/// topic vector and the payload for indexer-reconciliation tests.
+fn find_event(env: &Env, contract_id: &Address, name: &str) -> (soroban_sdk::Vec<Val>, Val) {
+    let events = env.events().all();
+    for (contract, topics, data) in events.iter().rev() {
+        if contract != *contract_id {
+            continue;
+        }
+        let sym: Symbol = topics.get(0).unwrap().try_into_val(env).unwrap();
+        if sym == Symbol::new(env, name) {
+            return (topics, data);
+        }
+    }
+    panic!("event {} not found", name);
+}
+
+/// #67 — Completed enrollments follow the documented refund policy.
+///
+/// The refund policy: only incomplete enrollments within the refund window
+/// are eligible. A completed enrollment is permanently excluded —
+/// `request_refund` panics with "already marked as completed", and
+/// `archive_course` skips any enrollment where `completed == true`. This
+/// test exercises both the request_refund path and the archive_course path
+/// and asserts that completion cannot bypass the eligibility rules.
+#[test]
+fn test_completed_enrollment_follows_refund_policy() {
+    let (env, contract_id, token_id, admin, sec_admin, _treasury, instructor) = setup();
+    let client = SorobanLardContractClient::new(&env, &contract_id);
+    let token_client = token::Client::new(&env, &token_id);
+
+    let student_incomplete = Address::generate(&env);
+    let student_completed = Address::generate(&env);
+    let asset = token::StellarAssetClient::new(&env, &token_id);
+    asset.mint(&student_incomplete, &100_000_000_000);
+    asset.mint(&student_completed, &100_000_000_000);
+
+    register_and_approve_course(
+        &env,
+        &client,
+        &token_id,
+        &admin,
+        &instructor,
+        "COURSE-REFUND-POLICY-67",
+        1_000_000_000,
+    );
+    let course_id = String::from_str(&env, "COURSE-REFUND-POLICY-67");
+
+    // Enroll both students.
+    client.enroll(&student_incomplete, &course_id);
+    client.enroll(&student_completed, &course_id);
+
+    // Complete one enrollment.
+    client.mark_completed(
+        &admin,
+        &student_completed,
+        &course_id,
+        &Some(String::from_str(&env, "evidence-of-completion")),
+    );
+
+    // --- Incomplete enrollment CAN be refunded ---
+    client.request_refund(&student_incomplete, &course_id);
+    let balance_before = token_client.balance(&student_incomplete);
+    env.mock_all_auths_allowing_non_root_auth();
+    client.process_refund(&admin, &student_incomplete, &course_id, &true);
+    assert_eq!(
+        token_client.balance(&student_incomplete) - balance_before,
+        1_000_000_000,
+        "incomplete enrollment must be refundable"
+    );
+    assert!(!client.is_enrolled(&student_incomplete, &course_id));
+
+    // --- Completed enrollment CANNOT request a refund ---
+    let result = client.try_request_refund(&student_completed, &course_id);
+    assert!(
+        result.is_err(),
+        "completed enrollment must not be refundable via request_refund"
+    );
+    assert!(
+        client
+            .get_refund_request(&student_completed, &course_id)
+            .is_none(),
+        "no refund request should be created for a completed enrollment"
+    );
+
+    // --- archive_course skips completed enrollments ---
+    client.pause_course(&admin, &course_id);
+    let completed_balance_before = token_client.balance(&student_completed);
+    let mut refund_list = soroban_sdk::Vec::new(&env);
+    refund_list.push_back(student_completed.clone());
+    client.archive_course(&admin, &sec_admin, &course_id, &Some(refund_list));
+
+    assert_eq!(
+        token_client.balance(&student_completed),
+        completed_balance_before,
+        "completed enrollment must not be refunded by archive_course"
+    );
+    assert!(
+        client
+            .get_enrollment(&student_completed, &student_completed, &course_id)
+            .is_some(),
+        "completed enrollment record must persist after archive"
+    );
+}
+
+/// #68 — Refund rollback when the payout transfer fails.
+///
+/// `process_refund()` makes two transfers: treasury → student (platform share)
+/// and contract → student (instructor share). If either fails, the entire
+/// invocation reverts atomically: the enrollment, instructor earnings, contract
+/// pool balance, and refund request status remain unchanged. No
+/// `refund_processed` event is emitted.
+#[test]
+fn test_refund_rollback_when_payout_transfer_fails() {
+    let (env, contract_id, _sac_id, admin, _sec_admin, treasury, instructor) = setup();
+    let client = SorobanLardContractClient::new(&env, &contract_id);
+
+    let student = Address::generate(&env);
+    let funded = 1_000_000_000i128;
+    let (token_id, token) = setup_non_standard_token(&env, &client, &admin, &student, funded);
+
+    let price = 500_000_000i128;
+    register_and_approve_course(
+        &env,
+        &client,
+        &token_id,
+        &admin,
+        &instructor,
+        "COURSE-REFUND-ROLLBACK-68",
+        price,
+    );
+    let course_id = String::from_str(&env, "COURSE-REFUND-ROLLBACK-68");
+
+    // Enroll: platform gets 100M (20%), instructor gets 400M, contract holds 400M.
+    client.enroll(&student, &course_id);
+
+    // Capture pre-refund state.
+    let student_bal = token.balance(&student);
+    let treasury_bal = token.balance(&treasury);
+    let contract_bal = token.balance(&contract_id);
+    let instructor_earnings = client.get_instructor_earnings(&instructor, &token_id);
+    assert_eq!(instructor_earnings, 400_000_000);
+
+    // Request refund.
+    client.request_refund(&student, &course_id);
+    assert_eq!(
+        client
+            .get_refund_request(&student, &course_id)
+            .unwrap()
+            .status,
+        RefundStatus::Pending
+    );
+
+    // Force the instructor-share transfer (2nd transfer in process_refund) to fail.
+    // Transfer #1 (treasury → student) succeeds; transfer #2 (contract → student)
+    // panics, reverting the entire invocation including the debit and transfer #1.
+    env.mock_all_auths_allowing_non_root_auth();
+    token.fail_on_transfer(&2);
+    let result = client.try_process_refund(&admin, &student, &course_id, &true);
+    assert!(
+        result.is_err(),
+        "process_refund must fail when the payout transfer fails"
+    );
+
+    // Everything reverted — enrollment, balances, earnings, request status.
+    assert!(
+        client.is_enrolled(&student, &course_id),
+        "enrollment must still exist after rollback"
+    );
+    assert_eq!(
+        token.balance(&student),
+        student_bal,
+        "student balance must be unchanged"
+    );
+    assert_eq!(
+        token.balance(&treasury),
+        treasury_bal,
+        "treasury balance must be unchanged"
+    );
+    assert_eq!(
+        token.balance(&contract_id),
+        contract_bal,
+        "contract pool balance must be unchanged"
+    );
+    assert_eq!(
+        client.get_instructor_earnings(&instructor, &token_id),
+        instructor_earnings,
+        "instructor earnings must not be debited"
+    );
+    assert_eq!(
+        client
+            .get_refund_request(&student, &course_id)
+            .unwrap()
+            .status,
+        RefundStatus::Pending,
+        "refund request must still be pending"
+    );
+
+    // No refund_processed event was emitted (events revert on panic).
+    let emitted = env.events().all().iter().any(|(c, t, _)| {
+        if c != contract_id {
+            return false;
+        }
+        let sym: Symbol = t.get(0).unwrap().try_into_val(&env).unwrap();
+        sym == Symbol::new(&env, "refund_processed")
+    });
+    assert!(
+        !emitted,
+        "no refund_processed event should be emitted on failure"
+    );
+
+    // Control: disarming the failure lets the refund succeed normally.
+    token.fail_on_transfer(&0);
+    client.process_refund(&admin, &student, &course_id, &true);
+    assert!(
+        !client.is_enrolled(&student, &course_id),
+        "enrollment must be removed after successful refund"
+    );
+    assert_eq!(
+        client
+            .get_refund_request(&student, &course_id)
+            .unwrap()
+            .status,
+        RefundStatus::Approved,
+        "refund request must be approved after successful refund"
+    );
+}
+
+/// #69 — Refund event payloads are stable for indexer reconciliation.
+///
+/// Verifies the topic and payload schemas for `refund_requested` and
+/// `refund_processed` (both approved and rejected) so off-chain indexers
+/// can reconcile refunds without schema drift.
+///
+/// Event schemas (consumer regression fixture):
+/// - `refund_requested`: topics = ("refund_requested", course_id),
+///   data = (student: Address, course_id: String, amount_paid: i128)
+/// - `refund_processed`: topics = ("refund_processed", course_id),
+///   data = (student: Address, course_id: String, approved: bool, admin: Address)
+#[test]
+fn test_refund_event_payloads_for_indexer_reconciliation() {
+    let (env, contract_id, token_id, admin, _sec_admin, _treasury, instructor) = setup();
+    let client = SorobanLardContractClient::new(&env, &contract_id);
+
+    let student = Address::generate(&env);
+    token::StellarAssetClient::new(&env, &token_id).mint(&student, &100_000_000_000);
+
+    let price = 750_000_000i128;
+    register_and_approve_course(
+        &env,
+        &client,
+        &token_id,
+        &admin,
+        &instructor,
+        "COURSE-REFUND-EVT-69",
+        price,
+    );
+    let course_id = String::from_str(&env, "COURSE-REFUND-EVT-69");
+
+    // --- refund_requested ---
+    client.enroll(&student, &course_id);
+    client.request_refund(&student, &course_id);
+
+    let (rq_topics, rq_data) = find_event(&env, &contract_id, "refund_requested");
+    let rq_sym: Symbol = rq_topics.get(0).unwrap().try_into_val(&env).unwrap();
+    assert_eq!(rq_sym, Symbol::new(&env, "refund_requested"));
+    let rq_topic_course: String = rq_topics.get(1).unwrap().try_into_val(&env).unwrap();
+    assert_eq!(rq_topic_course, course_id);
+
+    let (rq_student, rq_course, rq_amount): (Address, String, i128) =
+        rq_data.try_into_val(&env).unwrap();
+    assert_eq!(rq_student, student);
+    assert_eq!(rq_course, course_id);
+    assert_eq!(rq_amount, price);
+
+    // --- refund_processed (approved) ---
+    env.mock_all_auths_allowing_non_root_auth();
+    client.process_refund(&admin, &student, &course_id, &true);
+
+    let (rp_topics, rp_data) = find_event(&env, &contract_id, "refund_processed");
+    let rp_sym: Symbol = rp_topics.get(0).unwrap().try_into_val(&env).unwrap();
+    assert_eq!(rp_sym, Symbol::new(&env, "refund_processed"));
+    let rp_topic_course: String = rp_topics.get(1).unwrap().try_into_val(&env).unwrap();
+    assert_eq!(rp_topic_course, course_id);
+
+    let (rp_student, rp_course, rp_approved, rp_admin): (Address, String, bool, Address) =
+        rp_data.try_into_val(&env).unwrap();
+    assert_eq!(rp_student, student);
+    assert_eq!(rp_course, course_id);
+    assert!(rp_approved);
+    assert_eq!(rp_admin, admin);
+
+    // --- refund_processed (rejected) ---
+    let student_b = Address::generate(&env);
+    token::StellarAssetClient::new(&env, &token_id).mint(&student_b, &100_000_000_000);
+
+    register_and_approve_course(
+        &env,
+        &client,
+        &token_id,
+        &admin,
+        &instructor,
+        "COURSE-REFUND-EVT-69B",
+        price,
+    );
+    let course_id_b = String::from_str(&env, "COURSE-REFUND-EVT-69B");
+
+    client.enroll(&student_b, &course_id_b);
+    client.request_refund(&student_b, &course_id_b);
+    client.process_refund(&admin, &student_b, &course_id_b, &false);
+
+    let (rp2_topics, rp2_data) = find_event(&env, &contract_id, "refund_processed");
+    let rp2_sym: Symbol = rp2_topics.get(0).unwrap().try_into_val(&env).unwrap();
+    assert_eq!(rp2_sym, Symbol::new(&env, "refund_processed"));
+    let rp2_topic_course: String = rp2_topics.get(1).unwrap().try_into_val(&env).unwrap();
+    assert_eq!(rp2_topic_course, course_id_b);
+
+    let (rp2_student, rp2_course, rp2_approved, rp2_admin): (Address, String, bool, Address) =
+        rp2_data.try_into_val(&env).unwrap();
+    assert_eq!(rp2_student, student_b);
+    assert_eq!(rp2_course, course_id_b);
+    assert!(!rp2_approved);
+    assert_eq!(rp2_admin, admin);
+}
+
+/// #70 — Archived enrollment records cannot be refunded twice.
+///
+/// After a refund, the enrollment is archived to EnrollmentHistory with
+/// `is_refunded = true` and removed from active storage. A second refund
+/// attempt — whether via `process_refund` or `archive_course` — must not
+/// transfer tokens or append another refunded history entry.
+#[test]
+fn test_archived_enrollment_cannot_be_refunded_twice() {
+    let (env, contract_id, token_id, admin, sec_admin, _treasury, instructor) = setup();
+    let client = SorobanLardContractClient::new(&env, &contract_id);
+    let token_client = token::Client::new(&env, &token_id);
+
+    let student = Address::generate(&env);
+    token::StellarAssetClient::new(&env, &token_id).mint(&student, &100_000_000_000);
+
+    register_and_approve_course(
+        &env,
+        &client,
+        &token_id,
+        &admin,
+        &instructor,
+        "COURSE-DOUBLE-REFUND-70",
+        1_000_000_000,
+    );
+    let course_id = String::from_str(&env, "COURSE-DOUBLE-REFUND-70");
+
+    // --- First refund succeeds ---
+    client.enroll(&student, &course_id);
+    client.request_refund(&student, &course_id);
+    let balance_before = token_client.balance(&student);
+    env.mock_all_auths_allowing_non_root_auth();
+    client.process_refund(&admin, &student, &course_id, &true);
+    let balance_after = token_client.balance(&student);
+    assert_eq!(balance_after - balance_before, 1_000_000_000);
+
+    // History has exactly one refunded entry.
+    let history = client.get_enrollment_history(&admin, &student, &course_id);
+    assert_eq!(history.len(), 1);
+    assert!(history.get(0).unwrap().is_refunded);
+
+    // --- Second process_refund must fail (request is no longer Pending) ---
+    let result = client.try_process_refund(&admin, &student, &course_id, &true);
+    assert!(
+        result.is_err(),
+        "second process_refund must fail — request is not pending"
+    );
+
+    // No additional tokens transferred.
+    assert_eq!(
+        token_client.balance(&student),
+        balance_after,
+        "no additional tokens after failed second refund"
+    );
+    // No additional history entry.
+    assert_eq!(
+        client
+            .get_enrollment_history(&admin, &student, &course_id)
+            .len(),
+        1,
+        "no additional history entry after failed second refund"
+    );
+
+    // --- archive_course also cannot double-refund ---
+    // The enrollment was removed from active storage by process_refund, so
+    // archive_course's `has(&enrollment_key)` check returns false and the
+    // student is skipped entirely — no transfer, no history entry.
+    client.pause_course(&admin, &course_id);
+    let mut refund_list = soroban_sdk::Vec::new(&env);
+    refund_list.push_back(student.clone());
+    client.archive_course(&admin, &sec_admin, &course_id, &Some(refund_list));
+
+    assert_eq!(
+        token_client.balance(&student),
+        balance_after,
+        "archive_course must not double-refund an already-refunded enrollment"
+    );
+    assert_eq!(
+        client
+            .get_enrollment_history(&admin, &student, &course_id)
+            .len(),
+        1,
+        "archive_course must not append a second refunded history entry"
+    );
+}
