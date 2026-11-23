@@ -14144,3 +14144,256 @@ fn test_current_wasm_hash_none_before_first_upgrade() {
 
     assert_eq!(client.get_current_wasm_hash(), None);
 }
+
+// ============================================================
+// CAPACITY & LIMIT BOUNDARY TESTS (#59, #60, #61, #62)
+// ============================================================
+
+fn register_and_approve_capped_course(
+    env: &Env,
+    client: &SorobanLardContractClient,
+    token_id: &Address,
+    admin: &Address,
+    instructor: &Address,
+    course_id: &str,
+    price: i128,
+    cap: u32,
+) {
+    client.register_course(
+        instructor,
+        &String::from_str(env, course_id),
+        &price,
+        token_id,
+        &0u32,
+        &Some(cap),
+        &BytesN::from_array(env, &[1u8; 32]),
+        &soroban_sdk::Vec::new(env),
+    );
+    env.ledger().with_mut(|l| {
+        l.sequence_number += 1;
+    });
+    client.approve_course(admin, &String::from_str(env, course_id));
+}
+
+fn funded_student(env: &Env, token_id: &Address) -> Address {
+    let s = Address::generate(env);
+    token::StellarAssetClient::new(env, token_id).mint(&s, &100_000_000_000);
+    s
+}
+
+fn try_register(
+    env: &Env,
+    client: &SorobanLardContractClient,
+    token_id: &Address,
+    instructor: &Address,
+    course_id: &str,
+    categories: soroban_sdk::Vec<String>,
+) -> bool {
+    client
+        .try_register_course(
+            instructor,
+            &String::from_str(env, course_id),
+            &1_000_000_000,
+            token_id,
+            &0u32,
+            &None,
+            &BytesN::from_array(env, &[1u8; 32]),
+            &categories,
+        )
+        .is_ok()
+}
+
+#[test]
+fn test_instructor_course_limit_exact_boundary() {
+    let (env, contract_id, token_id, admin, _sec, _treasury, instructor) = setup();
+    let client = SorobanLardContractClient::new(&env, &contract_id);
+    client.update_max_courses_limit(&admin, &3u32);
+
+    for i in 0..3 {
+        let id = format!("LIMIT-{}", i);
+        assert!(try_register(&env, &client, &token_id, &instructor, &id, soroban_sdk::Vec::new(&env)));
+    }
+    assert_eq!(client.get_instructor_course_count(&instructor), 3);
+    let catalog_before = client.list_courses(&0u32, &100u32);
+    let by_instructor_before = client.get_courses_by_instructor(&instructor);
+
+    // One past the limit is rejected.
+    assert!(!try_register(&env, &client, &token_id, &instructor, "LIMIT-3", soroban_sdk::Vec::new(&env)));
+
+    // Nothing changed.
+    assert_eq!(client.get_instructor_course_count(&instructor), 3);
+    assert_eq!(client.list_courses(&0u32, &100u32), catalog_before);
+    assert_eq!(client.get_courses_by_instructor(&instructor), by_instructor_before);
+    assert!(client.get_course(&String::from_str(&env, "LIMIT-3")).is_none());
+}
+
+#[test]
+fn test_register_course_category_count_boundary() {
+    let (env, contract_id, token_id, _admin, _sec, _treasury, instructor) = setup();
+    let client = SorobanLardContractClient::new(&env, &contract_id);
+
+    let mut cats = soroban_sdk::Vec::new(&env);
+    for i in 0..10 {
+        cats.push_back(String::from_str(&env, &format!("cat{}", i)));
+    }
+    // Exactly MAX_CATEGORIES (10) is accepted.
+    assert!(try_register(&env, &client, &token_id, &instructor, "CAT-OK", cats.clone()));
+    assert_eq!(
+        client.get_course(&String::from_str(&env, "CAT-OK")).unwrap().categories.len(),
+        10
+    );
+
+    // 11 is rejected without writing state.
+    cats.push_back(String::from_str(&env, "cat10"));
+    assert!(!try_register(&env, &client, &token_id, &instructor, "CAT-BAD", cats));
+    assert!(client.get_course(&String::from_str(&env, "CAT-BAD")).is_none());
+    assert_eq!(client.get_instructor_course_count(&instructor), 1);
+}
+
+#[test]
+fn test_register_course_category_length_boundary() {
+    let (env, contract_id, token_id, _admin, _sec, _treasury, instructor) = setup();
+    let client = SorobanLardContractClient::new(&env, &contract_id);
+
+    // Exactly MAX_CATEGORY_LEN (64) is accepted.
+    let mut ok = soroban_sdk::Vec::new(&env);
+    ok.push_back(String::from_str(&env, &"a".repeat(64)));
+    assert!(try_register(&env, &client, &token_id, &instructor, "LEN-OK", ok));
+
+    // 65 is rejected without writing state.
+    let mut bad = soroban_sdk::Vec::new(&env);
+    bad.push_back(String::from_str(&env, "valid"));
+    bad.push_back(String::from_str(&env, &"a".repeat(65)));
+    assert!(!try_register(&env, &client, &token_id, &instructor, "LEN-BAD", bad));
+    assert!(client.get_course(&String::from_str(&env, "LEN-BAD")).is_none());
+    assert_eq!(client.get_instructor_course_count(&instructor), 1);
+}
+
+#[test]
+#[should_panic(expected = "register_course: too many categories")]
+fn test_register_course_too_many_categories_panics() {
+    let (env, contract_id, token_id, _admin, _sec, _treasury, instructor) = setup();
+    let client = SorobanLardContractClient::new(&env, &contract_id);
+    let mut cats = soroban_sdk::Vec::new(&env);
+    for i in 0..11 {
+        cats.push_back(String::from_str(&env, &format!("c{}", i)));
+    }
+    client.register_course(
+        &instructor,
+        &String::from_str(&env, "CAT-PANIC"),
+        &1_000_000_000,
+        &token_id,
+        &0u32,
+        &None,
+        &BytesN::from_array(&env, &[1u8; 32]),
+        &cats,
+    );
+}
+
+#[test]
+#[should_panic(expected = "register_course: category name too long")]
+fn test_register_course_category_too_long_panics() {
+    let (env, contract_id, token_id, _admin, _sec, _treasury, instructor) = setup();
+    let client = SorobanLardContractClient::new(&env, &contract_id);
+    let mut cats = soroban_sdk::Vec::new(&env);
+    cats.push_back(String::from_str(&env, &"x".repeat(65)));
+    client.register_course(
+        &instructor,
+        &String::from_str(&env, "LEN-PANIC"),
+        &1_000_000_000,
+        &token_id,
+        &0u32,
+        &None,
+        &BytesN::from_array(&env, &[1u8; 32]),
+        &cats,
+    );
+}
+
+#[test]
+fn test_enroll_rejected_at_capacity_no_side_effects() {
+    let (env, contract_id, token_id, admin, _sec, treasury, instructor) = setup();
+    let client = SorobanLardContractClient::new(&env, &contract_id);
+    let token = token::Client::new(&env, &token_id);
+    register_and_approve_capped_course(
+        &env, &client, &token_id, &admin, &instructor, "CAP-FULL", 1_000_000_000, 2,
+    );
+    let cid = String::from_str(&env, "CAP-FULL");
+
+    client.enroll(&funded_student(&env, &token_id), &cid);
+    client.enroll(&funded_student(&env, &token_id), &cid);
+    let course = client.get_course(&cid).unwrap();
+    assert_eq!(course.total_enrollments, 2);
+    assert_eq!(course.active_enrollments, 2);
+
+    let extra = funded_student(&env, &token_id);
+    let extra_bal = token.balance(&extra);
+    let treasury_bal = token.balance(&treasury);
+    let contract_bal = token.balance(&contract_id);
+    let total_active = client.get_total_active_enrollments();
+
+    assert!(client.try_enroll(&extra, &cid).is_err());
+
+    // No transfer, no enrollment record, no counter increment.
+    assert_eq!(token.balance(&extra), extra_bal);
+    assert_eq!(token.balance(&treasury), treasury_bal);
+    assert_eq!(token.balance(&contract_id), contract_bal);
+    assert!(!client.is_enrolled(&extra, &cid));
+    let course = client.get_course(&cid).unwrap();
+    assert_eq!(course.total_enrollments, 2);
+    assert_eq!(course.active_enrollments, 2);
+    assert_eq!(client.get_total_active_enrollments(), total_active);
+}
+
+#[test]
+#[should_panic(expected = "course has reached maximum enrollment capacity")]
+fn test_enroll_at_capacity_panics() {
+    let (env, contract_id, token_id, admin, _sec, _treasury, instructor) = setup();
+    let client = SorobanLardContractClient::new(&env, &contract_id);
+    register_and_approve_capped_course(
+        &env, &client, &token_id, &admin, &instructor, "CAP-ONE", 1_000_000_000, 1,
+    );
+    let cid = String::from_str(&env, "CAP-ONE");
+    client.enroll(&funded_student(&env, &token_id), &cid);
+    client.enroll(&funded_student(&env, &token_id), &cid);
+}
+
+#[test]
+fn test_capacity_released_after_refund() {
+    let (env, contract_id, token_id, admin, _sec, _treasury, instructor) = setup();
+    let client = SorobanLardContractClient::new(&env, &contract_id);
+    client.update_refund_window(&admin, &10u32);
+    register_and_approve_capped_course(
+        &env, &client, &token_id, &admin, &instructor, "CAP-REFUND", 1_000_000_000, 2,
+    );
+    let cid = String::from_str(&env, "CAP-REFUND");
+
+    let s1 = funded_student(&env, &token_id);
+    let s2 = funded_student(&env, &token_id);
+    client.enroll(&s1, &cid);
+    client.enroll(&s2, &cid);
+    let c = client.get_course(&cid).unwrap();
+    assert_eq!((c.total_enrollments, c.active_enrollments), (2, 2));
+    assert_eq!(client.get_total_active_enrollments(), 2);
+
+    let s3 = funded_student(&env, &token_id);
+    assert!(client.try_enroll(&s3, &cid).is_err());
+
+    client.request_refund(&s1, &cid);
+    env.mock_all_auths_allowing_non_root_auth();
+    client.process_refund(&admin, &s1, &cid, &true);
+    assert!(!client.is_enrolled(&s1, &cid));
+    let c = client.get_course(&cid).unwrap();
+    assert_eq!((c.total_enrollments, c.active_enrollments), (1, 1));
+    assert_eq!(client.get_total_active_enrollments(), 1);
+
+    // The released seat can be taken by a new student.
+    client.enroll(&s3, &cid);
+    assert!(client.is_enrolled(&s3, &cid));
+    let c = client.get_course(&cid).unwrap();
+    assert_eq!((c.total_enrollments, c.active_enrollments), (2, 2));
+    assert_eq!(client.get_total_active_enrollments(), 2);
+
+    // And the course is full again.
+    let s4 = funded_student(&env, &token_id);
+    assert!(client.try_enroll(&s4, &cid).is_err());
+}

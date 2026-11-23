@@ -4833,6 +4833,11 @@ impl SorobanLardContract {
             if course.active_enrollments > 0 {
                 course.active_enrollments -= 1;
             }
+            // Release the capacity slot: `max_capacity` is enforced against
+            // `total_enrollments`, so a refunded seat must be returned (#61).
+            if course.total_enrollments > 0 {
+                course.total_enrollments -= 1;
+            }
 
             course.last_updated_ledger = env.ledger().sequence();
             env.storage()
