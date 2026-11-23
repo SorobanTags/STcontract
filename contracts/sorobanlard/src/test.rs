@@ -14144,3 +14144,168 @@ fn test_current_wasm_hash_none_before_first_upgrade() {
 
     assert_eq!(client.get_current_wasm_hash(), None);
 }
+
+// ============================================================
+// BULK REVOCATION WITH MISSING CERTIFICATE RECORDS (#88)
+// ============================================================
+
+#[test]
+fn test_bulk_revoke_skips_missing_middle_certificate() {
+    let (env, contract_id, token_id, admin, _sec_admin, _treasury, instructor) = setup();
+    let client = SorobanLardContractClient::new(&env, &contract_id);
+
+    register_and_approve_course(
+        &env,
+        &client,
+        &token_id,
+        &admin,
+        &instructor,
+        "COURSE-MISS-MID",
+        100_000_000,
+    );
+    let course_id = String::from_str(&env, "COURSE-MISS-MID");
+    let cert_names = ["CERT-MISS-MID-0", "CERT-MISS-MID-1", "CERT-MISS-MID-2"];
+    for cert_name in cert_names {
+        let student = Address::generate(&env);
+        enroll_and_certify(
+            &env,
+            &client,
+            &token_id,
+            &admin,
+            &student,
+            "COURSE-MISS-MID",
+            cert_name,
+        );
+    }
+
+    // Simulate TTL expiry of the middle certificate's record. The index
+    // still lists the ID, but the Certificate record is gone.
+    let missing_cert = String::from_str(&env, "CERT-MISS-MID-1");
+    env.as_contract(&contract_id, || {
+        env.storage()
+            .persistent()
+            .remove(&DataKey::Certificate(missing_cert.clone()));
+    });
+
+    // Bulk revocation must not panic on the missing entry — it skips it
+    // and continues to the live certificates that follow.
+    let revoked_count = client.bulk_revoke_course_certificates(&admin, &course_id);
+    assert_eq!(revoked_count, 2);
+
+    // The two live certificates are revoked.
+    assert!(
+        client
+            .get_certificate(&admin, &String::from_str(&env, "CERT-MISS-MID-0"))
+            .revoked
+    );
+    assert!(
+        client
+            .get_certificate(&admin, &String::from_str(&env, "CERT-MISS-MID-2"))
+            .revoked
+    );
+
+    // The index is unchanged — the missing entry is still listed.
+    assert_eq!(client.get_course_certificates(&course_id).len(), 3);
+}
+
+#[test]
+fn test_bulk_revoke_skips_missing_first_certificate() {
+    let (env, contract_id, token_id, admin, _sec_admin, _treasury, instructor) = setup();
+    let client = SorobanLardContractClient::new(&env, &contract_id);
+
+    register_and_approve_course(
+        &env,
+        &client,
+        &token_id,
+        &admin,
+        &instructor,
+        "COURSE-MISS-FIRST",
+        100_000_000,
+    );
+    let course_id = String::from_str(&env, "COURSE-MISS-FIRST");
+    let cert_names = [
+        "CERT-MISS-FIRST-0",
+        "CERT-MISS-FIRST-1",
+        "CERT-MISS-FIRST-2",
+    ];
+    for cert_name in cert_names {
+        let student = Address::generate(&env);
+        enroll_and_certify(
+            &env,
+            &client,
+            &token_id,
+            &admin,
+            &student,
+            "COURSE-MISS-FIRST",
+            cert_name,
+        );
+    }
+
+    // Remove the first certificate's record — the loop must not abort here.
+    env.as_contract(&contract_id, || {
+        env.storage()
+            .persistent()
+            .remove(&DataKey::Certificate(String::from_str(
+                &env,
+                "CERT-MISS-FIRST-0",
+            )));
+    });
+
+    let revoked_count = client.bulk_revoke_course_certificates(&admin, &course_id);
+    assert_eq!(revoked_count, 2);
+
+    assert!(
+        client
+            .get_certificate(&admin, &String::from_str(&env, "CERT-MISS-FIRST-1"))
+            .revoked
+    );
+    assert!(
+        client
+            .get_certificate(&admin, &String::from_str(&env, "CERT-MISS-FIRST-2"))
+            .revoked
+    );
+}
+
+#[test]
+fn test_bulk_revoke_all_missing_certificates_returns_zero() {
+    let (env, contract_id, token_id, admin, _sec_admin, _treasury, instructor) = setup();
+    let client = SorobanLardContractClient::new(&env, &contract_id);
+
+    register_and_approve_course(
+        &env,
+        &client,
+        &token_id,
+        &admin,
+        &instructor,
+        "COURSE-ALL-MISSING",
+        100_000_000,
+    );
+    let course_id = String::from_str(&env, "COURSE-ALL-MISSING");
+    let student = Address::generate(&env);
+    enroll_and_certify(
+        &env,
+        &client,
+        &token_id,
+        &admin,
+        &student,
+        "COURSE-ALL-MISSING",
+        "CERT-ALL-MISSING-0",
+    );
+
+    // Remove the only certificate record — the index still lists it.
+    env.as_contract(&contract_id, || {
+        env.storage()
+            .persistent()
+            .remove(&DataKey::Certificate(String::from_str(
+                &env,
+                "CERT-ALL-MISSING-0",
+            )));
+    });
+
+    // No panic, no live certificates to revoke — returns 0 deterministically.
+    let revoked_count = client.bulk_revoke_course_certificates(&admin, &course_id);
+    assert_eq!(revoked_count, 0);
+
+    // The index is still intact.
+    assert_eq!(client.get_course_certificates(&course_id).len(), 1);
+}

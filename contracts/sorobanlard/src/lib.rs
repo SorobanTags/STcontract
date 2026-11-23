@@ -3735,6 +3735,18 @@ impl SorobanLardContract {
 
         for i in 0..certificate_ids.len() {
             let certificate_id = certificate_ids.get(i).unwrap();
+            // An index entry whose Certificate record has expired from
+            // persistent storage (TTL garbage collection) is skipped rather
+            // than aborting the entire batch. A missing record is not a live
+            // certificate and must not prevent later entries from being
+            // processed.
+            if !env
+                .storage()
+                .persistent()
+                .has(&DataKey::Certificate(certificate_id.clone()))
+            {
+                continue;
+            }
             if Self::apply_revocation(&env, &admin, &certificate_id, &reason) {
                 revoked_count = revoked_count
                     .checked_add(1)
