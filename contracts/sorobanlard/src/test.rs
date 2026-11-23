@@ -1810,6 +1810,135 @@ fn test_archive_course_rejects_oversized_refund_list() {
     client.archive_course(&admin, &sec_admin, &course_id, &Some(too_many));
 }
 
+// ============================================================
+// CERTIFICATE VERIFICATION AFTER COURSE ARCHIVAL (#89)
+// ============================================================
+
+#[test]
+fn test_certificate_still_valid_after_course_archival() {
+    let (env, contract_id, token_id, admin, sec_admin, _treasury, instructor) = setup();
+    let client = SorobanLardContractClient::new(&env, &contract_id);
+
+    register_and_approve_course(
+        &env,
+        &client,
+        &token_id,
+        &admin,
+        &instructor,
+        "COURSE-ARCHIVE-CERT",
+        100_000_000,
+    );
+    let course_id = String::from_str(&env, "COURSE-ARCHIVE-CERT");
+    let cert_id = String::from_str(&env, "CERT-ARCHIVE-1");
+    let student = Address::generate(&env);
+
+    enroll_and_certify(
+        &env,
+        &client,
+        &token_id,
+        &admin,
+        &student,
+        "COURSE-ARCHIVE-CERT",
+        "CERT-ARCHIVE-1",
+    );
+
+    // Certificate is valid before archival.
+    assert!(client.verify_certificate(&cert_id));
+    assert_eq!(client.get_course_certificates(&course_id).len(), 1);
+
+    // mark_completed already decremented active_enrollments to 0, so the
+    // course can be archived without any student refunds.
+    client.pause_course(&admin, &course_id);
+    env.mock_all_auths_allowing_non_root_auth();
+    client.archive_course(&admin, &sec_admin, &course_id, &None);
+
+    // The course is now archived but still retrievable.
+    let course = client.get_course(&course_id).unwrap();
+    assert_eq!(course.status, CourseStatus::Archived);
+
+    // Archival must not erase or revoke an otherwise valid credential.
+    assert!(
+        client.verify_certificate(&cert_id),
+        "certificate should remain valid after course archival"
+    );
+
+    // The full certificate record is still retrievable and unrevoked.
+    let cert = client.get_certificate(&admin, &cert_id);
+    assert!(!cert.revoked);
+    assert_eq!(cert.course_id, course_id);
+    assert_eq!(cert.student, student);
+    assert_eq!(cert.revocation_reason, None);
+
+    // The certificate index is preserved — archival does not prune it.
+    assert_eq!(client.get_course_certificates(&course_id).len(), 1);
+    assert_eq!(
+        client.get_course_certificates(&course_id).get(0).unwrap(),
+        cert_id
+    );
+}
+
+#[test]
+fn test_multiple_certificates_survive_archival_independently() {
+    let (env, contract_id, token_id, admin, sec_admin, _treasury, instructor) = setup();
+    let client = SorobanLardContractClient::new(&env, &contract_id);
+
+    register_and_approve_course(
+        &env,
+        &client,
+        &token_id,
+        &admin,
+        &instructor,
+        "COURSE-ARCHIVE-MULTI",
+        100_000_000,
+    );
+    let course_id = String::from_str(&env, "COURSE-ARCHIVE-MULTI");
+    let cert_names = [
+        "CERT-ARCH-MULTI-0",
+        "CERT-ARCH-MULTI-1",
+        "CERT-ARCH-MULTI-2",
+    ];
+
+    for cert_name in cert_names {
+        let student = Address::generate(&env);
+        enroll_and_certify(
+            &env,
+            &client,
+            &token_id,
+            &admin,
+            &student,
+            "COURSE-ARCHIVE-MULTI",
+            cert_name,
+        );
+    }
+
+    assert_eq!(client.get_course_certificates(&course_id).len(), 3);
+
+    // All three students completed, so active_enrollments is 0.
+    client.pause_course(&admin, &course_id);
+    env.mock_all_auths_allowing_non_root_auth();
+    client.archive_course(&admin, &sec_admin, &course_id, &None);
+
+    assert_eq!(
+        client.get_course(&course_id).unwrap().status,
+        CourseStatus::Archived
+    );
+
+    // Every certificate is independently verifiable after archival.
+    for cert_name in cert_names {
+        let cert_id = String::from_str(&env, cert_name);
+        assert!(
+            client.verify_certificate(&cert_id),
+            "{} should be valid after archival",
+            cert_name
+        );
+        let cert = client.get_certificate(&admin, &cert_id);
+        assert!(!cert.revoked);
+    }
+
+    // The index is intact and still lists every issued certificate.
+    assert_eq!(client.get_course_certificates(&course_id).len(), 3);
+}
+
 #[test]
 #[should_panic]
 fn test_enroll_insufficient_funds_rollback() {
