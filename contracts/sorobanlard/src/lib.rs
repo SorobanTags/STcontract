@@ -907,6 +907,10 @@ impl SorobanLardContract {
     /// after which a course is automatically paused as a circuit breaker.
     /// Reset to 0 on a successful enrollment. (#178)
     const CIRCUIT_BREAKER_THRESHOLD: u32 = 5;
+    /// Maximum enrollment discount, in basis points (50%). Discounts above
+    /// this bound are rejected so a malformed coupon cannot make an enrollment
+    /// free or underflow the payment split. (#114)
+    const MAX_ENROLLMENT_DISCOUNT_BPS: u32 = 5_000;
     /// Maximum number of categories a course can have (#165)
     const MAX_CATEGORIES: u32 = 10;
     /// Maximum length of a category name in characters (#165)
@@ -2353,6 +2357,28 @@ impl SorobanLardContract {
         Self::enroll_internal(&env, &student, &course_id);
     }
 
+    /// Enroll a student with a validated discount applied to the course price.
+    ///
+    /// `discount_bps` is expressed in basis points and must not exceed
+    /// `MAX_ENROLLMENT_DISCOUNT_BPS` (5,000). The discounted amount flows
+    /// through the same payment split, earnings credit and enrollment event
+    /// as a regular `enroll()` call, so the recorded `amount_paid` matches
+    /// the funds actually transferred. (#114)
+    pub fn enroll_with_discount(
+        env: Env,
+        student: Address,
+        course_id: String,
+        discount_bps: u32,
+    ) {
+        student.require_auth();
+        Self::enroll_internal_with_discount(
+            &env,
+            &student,
+            &course_id,
+            Some(discount_bps),
+        );
+    }
+
     /// Enroll a student in multiple courses atomically.
     /// The entire batch succeeds or the entire batch fails — no partial state.
     ///
@@ -2407,6 +2433,22 @@ impl SorobanLardContract {
             let course = validated.get(i).unwrap();
             Self::enroll_internal_validated(&env, &student, &course_id, course);
         }
+    }
+
+    /// Atomically enroll a student in a named bundle of courses.
+    ///
+    /// This is the bundle-oriented entry point for `batch_enroll()`: every
+    /// guard is checked up front and either all courses are enrolled or none
+    /// are. A single `bundle_enrolled` event is emitted after the whole batch
+    /// succeeds so indexers can reconstruct the bundle without stitching
+    /// together individual `student_enrolled` events. (#122)
+    pub fn bundle_enroll(env: Env, student: Address, course_ids: Vec<String>) {
+        let count = course_ids.len();
+        Self::batch_enroll(env.clone(), student.clone(), course_ids);
+        env.events().publish(
+            (Symbol::new(&env, "bundle_enrolled"), student.clone()),
+            (student, count, env.ledger().sequence()),
+        );
     }
 
     /// Return the contents and total price of a course bundle without
@@ -2615,9 +2657,43 @@ impl SorobanLardContract {
         course
     }
 
+    /// Validate a discount rate and return the resulting price. A zero
+    /// discount is a no-op; rates above `MAX_ENROLLMENT_DISCOUNT_BPS` panic
+    /// before any token movement occurs.
+    fn discounted_price(env: &Env, price: i128, discount_bps: u32) -> i128 {
+        if discount_bps > Self::MAX_ENROLLMENT_DISCOUNT_BPS {
+            panic!(
+                "discount {} bps exceeds maximum {} bps",
+                discount_bps, Self::MAX_ENROLLMENT_DISCOUNT_BPS
+            );
+        }
+        if discount_bps == 0 {
+            return price;
+        }
+        price
+            .checked_mul((10_000u32 - discount_bps) as i128)
+            .unwrap_or_else(|| panic!("discount price overflow"))
+            / 10_000i128
+    }
+
     fn enroll_internal(env: &Env, student: &Address, course_id: &String) {
+        Self::enroll_internal_with_discount(env, student, course_id, None);
+    }
+
+    /// Apply a validated discount to the course price before the regular
+    /// enrollment and payment-split path runs.
+    fn enroll_internal_with_discount(
+        env: &Env,
+        student: &Address,
+        course_id: &String,
+        discount_bps: Option<u32>,
+    ) {
         let mut course = Self::validate_enrollment(env, student, course_id);
         let token_client = token::Client::new(env, &course.token);
+        let effective_price = match discount_bps {
+            Some(bps) => Self::discounted_price(&env, course.price, bps),
+            None => course.price,
+        };
 
         // #178 — Circuit breaker early-exit: if a prior failed invocation has already
         // pushed the per-course failure counter to the threshold, auto-pause the
@@ -2683,7 +2759,7 @@ impl SorobanLardContract {
         let (instructor_amount, platform_amount) = Self::deduct_fee(
             env,
             &course.token,
-            course.price,
+            effective_price,
             Self::course_fee_override_bps(&course),
             is_new_customer,
             is_btc_eth,
@@ -2737,20 +2813,20 @@ impl SorobanLardContract {
         // token transfer, balance check, fee distribution or earnings credit
         // takes place, and `platform_amount`/`instructor_amount` are already
         // `(0, 0)` because `deduct_fee()` short-circuits on a zero amount.
-        let actual_amount_paid = if course.price > 0 {
+        let actual_amount_paid = if effective_price > 0 {
             // Verify actual transfer amount by checking balance before and after
             let balance_before = token_client.balance(&env.current_contract_address());
-            token_client.transfer(student, &env.current_contract_address(), &course.price);
+            token_client.transfer(student, &env.current_contract_address(), &effective_price);
             let balance_after = token_client.balance(&env.current_contract_address());
 
             let actual_received = balance_after
                 .checked_sub(balance_before)
                 .unwrap_or_else(|| panic!("balance overflow during transfer verification"));
 
-            if actual_received != course.price {
+            if actual_received != effective_price {
                 panic!(
                     "token transfer amount mismatch: expected {}, received {}",
-                    course.price, actual_received
+                    effective_price, actual_received
                 );
             }
 
@@ -2871,7 +2947,7 @@ impl SorobanLardContract {
             .unwrap_or_else(|| panic!("active enrollment count overflow"));
         course.total_earned = course
             .total_earned
-            .checked_add(course.price)
+            .checked_add(effective_price)
             .unwrap_or_else(|| panic!("total earned overflow"));
         course.last_updated_ledger = env.ledger().sequence();
         env.storage()
@@ -2906,7 +2982,7 @@ impl SorobanLardContract {
             (
                 student.clone(),
                 course_id.clone(),
-                course.price,
+                effective_price,
                 platform_amount,
                 instructor_amount,
                 env.ledger().sequence(),
