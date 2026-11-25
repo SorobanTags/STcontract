@@ -19,5 +19,12 @@ test = false
 doc = false
 bench = false
 
+[[bin]]
+name = "batch_enroll"
+path = "fuzz_targets/batch_enroll.rs"
+test = false
+doc = false
+bench = false
+
 # Keep this crate out of the root workspace, which only lists contracts/*.
 [workspace]
