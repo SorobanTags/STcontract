@@ -189,3 +189,17 @@ rather than changed. Each is a candidate follow-up issue.
    course that must be `Paused`. `validate_enrollment` then panics with
    `"course is not available for enrollment"`, which reverts the whole
    archive call.
+
+### Archived lookup and storage expiry
+
+- During the `ARCHIVE_COOLDOWN_LEDGERS` window, up to and including the
+  boundary ledger, `get_course` returns the `Archived` record from
+  `DataKey::ArchivedCourse(id)`. It never recreates `DataKey::Course(id)`.
+- `archive_course` extends the archived entry's TTL to
+  `PERSISTENT_TTL_EXTEND_TO`, and each `get_course` call extends it again. If
+  nothing reads the key before that TTL runs out, the network archives the
+  entry. After that, `get_course` cannot read it: the transaction fails and
+  does not return `None`. The entry has to be restored (`RestoreFootprintOp`)
+  before it can be looked up again.
+- Coverage: `contracts/sorobanlard/src/test/course_status.rs`. Run it with
+  `cargo test -p sorobanlard course_status`.
