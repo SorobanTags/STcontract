@@ -21,13 +21,16 @@
 #                    Defaults to `testnet` below.
 #   CONTRACT_NAME    (optional) — overrides the contract/wasm base name.
 #                    Defaults to `sorobanlard` below.
+#   CONTRACT_ID      (required for verify-revoked) — the deployed contract ID to
+#                    query. No credentials are stored here; the read-only
+#                    invocation below needs no signing identity.
 
 NETWORK       = testnet
 CONTRACT_NAME = sorobanlard
 WASM_PATH     = target/wasm32v1-none/release/$(CONTRACT_NAME).wasm
 WASM_OPT      = target/wasm32v1-none/release/$(CONTRACT_NAME).optimized.wasm
 
-.PHONY: test build optimize deploy-testnet clean fmt check
+.PHONY: test build optimize deploy-testnet clean fmt check verify-revoked
 
 # Run the contract's Rust test suite via `cargo test`.
 test:
@@ -55,6 +58,29 @@ deploy-testnet: optimize
 		--source $(STELLAR_ACCOUNT) \
 		--network $(NETWORK)
 	@echo "Deployed. Remember to record the contract ID, Wasm hash, and date in DEPLOYMENTS.md."
+
+# Verify a certificate after it has been revoked.
+#
+# Usage:
+#   make verify-revoked CONTRACT_ID=<contract-id> CERT_ID=<certificate-id>
+#
+# This is a read-only simulation (no --source / signing identity required), so
+# the example carries no credentials or secrets. It invokes the public
+# `verify_certificate` entry point and prints the returned boolean.
+#
+# Expected result after revocation: `false`.
+#
+# To inspect the revocation record itself, query the contract's revocation
+# storage entry for the certificate (e.g. via `stellar contract invoke` on the
+# revocation getter, or `stellar contract read` against the ledger entry keyed
+# by the certificate ID) and confirm the certificate ID is present.
+verify-revoked:
+	@test -n "$(CONTRACT_ID)" || (echo "CONTRACT_ID is required" && exit 1)
+	@test -n "$(CERT_ID)" || (echo "CERT_ID is required" && exit 1)
+	stellar contract invoke \
+		--id $(CONTRACT_ID) \
+		--network $(NETWORK) \
+		-- verify_certificate --certificate_id $(CERT_ID)
 
 # Format the Rust sources with `cargo fmt`.
 fmt:

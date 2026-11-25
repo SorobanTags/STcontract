@@ -112,7 +112,10 @@ append-only collections. The rule of thumb for new keys is:
 
 Every current `DataKey` / `DataKey2` variant is classified in
 [docs/storage-keys.md](docs/storage-keys.md), along with the rationale and the
-race-freedom argument for `TotalActiveEnrollments`.
+race-freedom argument for `TotalActiveEnrollments`. Per-record TTL renewal
+(and which records can expire after inactivity) is in
+[docs/storage-ttl.md](docs/storage-ttl.md). Before changing any key or stored
+struct, follow [docs/storage-key-checklist.md](docs/storage-key-checklist.md).
 
 ---
 
@@ -244,8 +247,9 @@ Bulk revocation currently loads the full index and processes it in one
 transaction, so cost grows linearly and an arbitrarily large uncapped course
 can exceed transaction limits. The chosen policy is not to impose a new
 implicit issuance cap; use `max_certificates` when a course needs an enforced
-ceiling. Truly large uncapped courses need a paginated revocation API and an
-index representation that does not load the full list per page.
+ceiling. For truly large uncapped courses, `bulk_revoke_certificates_paged`
+processes the index in bounded pages so a single transaction never touches the
+full list — see the function table below.
 
 `EnrollmentHistory(student, course_id)` is also append-only and has no
 contract-level cap or pruning function. Each `re_enroll()` archives the full
@@ -294,6 +298,7 @@ Initialises the contract. Called once by the deployer, immediately after deploym
 | `issue_certificate(admin, student, course_id, cert_id, course_title, enrollment_reference, expires_at_ledger, instructor_signature)` | Admin | Issues on-chain certificate. Requires completion. `enrollment_reference` is a free-form backend ID (e.g. UUID). |
 | `revoke_certificate(admin, certificate_id, reason)` | Admin | Flags certificate as revoked |
 | `bulk_revoke_course_certificates(admin, course_id)` | Admin | Flags every certificate of a course as revoked in one transaction. Index entries whose Certificate record has expired from storage are skipped so live certificates are never silently passed over. |
+| `bulk_revoke_certificates_paged(admin, course_id, cursor, limit)` | Admin | Paginated bulk revocation — processes a bounded slice of the certificate index per call. Returns `BulkRevokePage { revoked_count, processed, next_cursor }`. Repeat with the returned `next_cursor` until it is `None`. Safe to retry a page: `apply_revocation` is idempotent so already-revoked certificates are not double-counted. |
 
 ### Admin management
 
@@ -492,6 +497,15 @@ When a release changes a stored struct (`Course`, `Enrollment`, `Certificate`, .
 ```bash
 make build      # → target/wasm32v1-none/release/sorobanlard.wasm
 make optimize   # → target/wasm32v1-none/release/sorobanlard.optimized.wasm
+```
+
+Deploy only `sorobanlard.optimized.wasm`. Verify its checksum and generate a
+release manifest as described in
+[docs/release-artifacts.md](docs/release-artifacts.md):
+
+```bash
+sha256sum contracts/sorobanlard/target/wasm32v1-none/release/sorobanlard.optimized.wasm
+scripts/release-manifest.sh
 ```
 
 ---
@@ -715,3 +729,60 @@ MIT
 
 <!-- handsoff-issue-146 -->
 - #146: Add invariant tests for accounting and multi-sig safety
+
+<!-- handsoff-issue-91 -->
+- #91: Test waitlist promotion never exceeds course capacity
+
+<!-- handsoff-issue-92 -->
+- #92: Test waitlist promotion order is FIFO
+
+<!-- handsoff-issue-93 -->
+- #93: Test duplicate waitlist joins are idempotent or rejected
+
+<!-- handsoff-issue-94 -->
+- #94: Test waitlist admission for courses without a capacity limit
+
+<!-- handsoff-issue-95 -->
+- #95: Test waitlist removal after a student enrolls directly
+
+<!-- handsoff-issue-96 -->
+- #96: Test waitlist event payloads for queue transitions
+
+<!-- handsoff-issue-97 -->
+- #97: Test arbitration escalation fee collection rollback
+
+<!-- handsoff-issue-98 -->
+- #98: Test arbitration timeout exactly at its configured ledger
+
+<!-- handsoff-issue-99 -->
+- #99: Test duplicate arbitration escalation for an open case
+
+<!-- handsoff-issue-100 -->
+- #100: Add a read-only arbitration case query for backend reconciliation
+
+<!-- handsoff-issue-101 -->
+- #101: Specify the subscription enrollment lifecycle
+
+<!-- handsoff-issue-102 -->
+- #102: Add persistent records for subscription enrollments
+
+<!-- handsoff-issue-103 -->
+- #103: Add an explicit paid subscription enrollment entrypoint
+
+<!-- handsoff-issue-104 -->
+- #104: Add explicit subscription renewal transactions
+
+<!-- handsoff-issue-105 -->
+- #105: Enforce subscription expiry in enrollment read queries
+
+<!-- handsoff-issue-106 -->
+- #106: Define subscription cancellation and refund behavior
+
+<!-- handsoff-issue-107 -->
+- #107: Emit events for subscription lifecycle changes
+
+<!-- handsoff-issue-108 -->
+- #108: Test subscription payment failures leave no partial state
+
+<!-- handsoff-issue-109 -->
+- #109: Add storage migration coverage for subscription records
