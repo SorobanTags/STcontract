@@ -73,6 +73,11 @@ Every multi-sig operation requires both `Admin` and `SecondaryAdmin`. A single k
 A second call to `init` is rejected, so `init` cannot be used to overwrite admin, treasury or fee configuration.
 - Enforced in: `init`
 - Tests: `test_invariant_inv10_init_only_once`
+
+### INV-11 — Certificate IDs are unique
+`issue_certificate` rejects an ID that has already been used, even for a different student or course. The original `Certificate` record is left untouched, and the course certificate index (`CourseCertificates`) holds exactly one entry per ID.
+- Enforced in: `issue_certificate` (existing-ID check before writing the certificate or index entry)
+- Tests: `test_issue_certificate_rejects_duplicate_id`
 ## Detailed audit model
 
 This is the list of financial and state-machine invariants the SorobanLard

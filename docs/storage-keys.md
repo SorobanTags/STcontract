@@ -49,7 +49,7 @@ by users, courses, enrollments, or certificates must be persistent.
 | `DataKey::Treasury` | Instance | Singleton payout address. |
 | `DataKey::DefaultFee` | Instance | Singleton global fee config. |
 | `DataKey::PendingTreasury` | Instance | Singleton pending treasury update. |
-| `DataKey::ApprovedToken(Address)` | Instance | Small, bounded whitelist flag read on enrollment; one flag per approved token. |
+| `DataKey::ApprovedToken(Address)` | Instance | Small, bounded whitelist flag read on enrollment and by the read-only `get_approved_token` query; one flag per approved token. |
 | `DataKey::PendingAdmin` | Instance | Singleton pending admin transfer. |
 | `DataKey::PendingSecondaryAdmin` | Instance | Singleton pending admin transfer. |
 | `DataKey::PlatformPaused` | Instance | Singleton global pause flag. |
@@ -92,6 +92,21 @@ by users, courses, enrollments, or certificates must be persistent.
 | `InstructorRegisteredKey { instructor }` | Persistent | Standalone key; one flag per instructor recording registry membership, so `register_course` avoids scanning `InstructorRegistry`. |
 | `DataKey2::HighValueCourseThreshold` | Instance | Singleton global config. |
 | `DataKey2::HighValueCourseApproval(String)` | Instance | Short-lived per-course co-signature state (transient governance step). |
+
+## Approved-token reads and writes
+
+`DataKey::ApprovedToken(Address)` is the only storage touched by token
+approval. Two paths interact with it:
+
+- **Read-only query.** `get_approved_token(token)` returns whether `token` is
+  currently approved. It reads the flag through `instance()`, extends the
+  instance TTL, and never writes the flag, so callers can inspect the approved
+  set without any mutable access. Unconfigured tokens simply return `false`.
+- **Approval validation.** `approve_token(token)` validates the candidate
+  before writing this key. The token contract must be a SAC-compatible asset
+  contract exposing the expected interface and must report seven decimals;
+  unsupported contracts are rejected and the approved-token set is left
+  unchanged.
 
 ## Platform counter race-freedom
 

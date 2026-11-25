@@ -280,6 +280,134 @@ proptest! {
         );
     }
 
+    /// A default-fee update only affects courses registered afterwards: a
+    /// course registered before `update_default_fee` keeps its original
+    /// stored fee and enrollments keep charging that fee, while a course
+    /// registered after the update uses the new default.
+    #[test]
+    fn prop_default_fee_update_does_not_rewrite_existing_courses(
+        old_default in 0u32..=100,
+        new_default in 0u32..=100,
+        price in course_price(),
+    ) {
+        let (env, contract_id, token_id, admin, _sec_admin, _treasury, instructor) = setup();
+        let client = SorobanLardContractClient::new(&env, &contract_id);
+
+        client.update_default_fee(&admin, &old_default);
+
+        let before_id = String::from_str(&env, "PROP-BEFORE");
+        client.register_course(
+            &instructor,
+            &before_id,
+            &price,
+            &token_id,
+            &old_default,
+            &None,
+            &BytesN::from_array(&env, &[2u8; 32]),
+            &soroban_sdk::Vec::new(&env),
+        );
+        env.ledger().with_mut(|l| {
+            l.sequence_number += 1;
+        });
+        client.approve_course(&admin, &before_id);
+
+        client.update_default_fee(&admin, &new_default);
+
+        let after_id = String::from_str(&env, "PROP-AFTER");
+        client.register_course(
+            &instructor,
+            &after_id,
+            &price,
+            &token_id,
+            &new_default,
+            &None,
+            &BytesN::from_array(&env, &[3u8; 32]),
+            &soroban_sdk::Vec::new(&env),
+        );
+        env.ledger().with_mut(|l| {
+            l.sequence_number += 1;
+        });
+        client.approve_course(&admin, &after_id);
+
+        // The pre-update course keeps its original fee.
+        let before_course = client.get_course(&before_id).unwrap();
+        prop_assert_eq!(before_course.fee_percentage, old_default);
+        let after_course = client.get_course(&after_id).unwrap();
+        prop_assert_eq!(after_course.fee_percentage, new_default);
+
+        // Enrollments charge the fee stored on each course, not the live
+        // default.
+        let student = Address::generate(&env);
+        if price > 0 {
+            token::StellarAssetClient::new(&env, &token_id).mint(&student, &(price * 2));
+        }
+        client.enroll(&student, &before_id);
+        let before_enrollment = client
+            .get_enrollment(&student, &student, &before_id)
+            .unwrap();
+        prop_assert_eq!(
+            before_enrollment.platform_amount,
+            price * old_default as i128 / 100
+        );
+
+        client.enroll(&student, &after_id);
+        let after_enrollment = client
+            .get_enrollment(&student, &student, &after_id)
+            .unwrap();
+        prop_assert_eq!(
+            after_enrollment.platform_amount,
+            price * new_default as i128 / 100
+        );
+
+        // The stored fee of the pre-update course is still unchanged.
+        prop_assert_eq!(
+            client.get_course(&before_id).unwrap().fee_percentage,
+            old_default
+        );
+    }
+
+    /// `get_approved_token` is a pure read of the approved-token set: it
+    /// returns true iff the token was added and not removed, and failed
+    /// `add_approved_token` calls (unsupported contracts) leave it unchanged.
+    #[test]
+    fn prop_approved_token_query_matches_set(
+        seed in any::<u32>(),
+        remove in any::<bool>(),
+    ) {
+        let (env, contract_id, token_id, admin, _sec_admin, _treasury, _instructor) = setup();
+        let client = SorobanLardContractClient::new(&env, &contract_id);
+
+        // A random, unconfigured address is never approved.
+        let random = Address::from_str(
+            &env,
+            "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD2KM",
+        );
+        prop_assert!(!client.get_approved_token(&random));
+
+        // The configured SAC token starts unapproved.
+        prop_assert!(!client.get_approved_token(&token_id));
+
+        client.add_approved_token(&admin, &token_id);
+        prop_assert!(client.get_approved_token(&token_id));
+
+        // A non-SAC contract must be rejected without changing the set.
+        let unsupported = env.register(
+            UnsupportedToken,
+            (),
+        );
+        let before = client.get_approved_token(&token_id);
+        prop_assert!(client
+            .try_add_approved_token(&admin, &unsupported)
+            .is_err());
+        prop_assert_eq!(client.get_approved_token(&token_id), before);
+        prop_assert!(!client.get_approved_token(&unsupported));
+
+        if remove || seed % 2 == 0 {
+            client.remove_approved_token(&admin, &token_id);
+            prop_assert!(!client.get_approved_token(&token_id));
+        }
+    }
+
     /// An approved refund returns exactly what was paid: the student is made
     /// whole, the treasury and contract return to zero, and no instructor
     /// earnings remain.

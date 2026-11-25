@@ -291,7 +291,7 @@ Initialises the contract. Called once by the deployer, immediately after deploym
 | Function | Caller | Description |
 |---|---|---|
 | `mark_completed(admin, student, course_id, evidence_hash)` | Admin | Called after backend verifies all lessons done. A non-empty `evidence_hash` replaces the student co-signature. |
-| `issue_certificate(admin, student, course_id, cert_id, course_title, enrollment_reference, expires_at_ledger, instructor_signature)` | Admin | Issues on-chain certificate. Requires completion. `enrollment_reference` is a free-form backend ID (e.g. UUID). |
+| `issue_certificate(admin, student, course_id, cert_id, course_title, enrollment_reference, expires_at_ledger, instructor_signature)` | Admin | Issues on-chain certificate. Requires completion. `enrollment_reference` is a free-form backend ID (e.g. UUID). `cert_id` must be unique: reusing an existing ID panics, the original certificate is preserved, and no duplicate index entry is written. |
 | `revoke_certificate(admin, certificate_id, reason)` | Admin | Flags certificate as revoked |
 | `bulk_revoke_course_certificates(admin, course_id)` | Admin | Flags every certificate of a course as revoked in one transaction |
 
@@ -314,6 +314,37 @@ Initialises the contract. Called once by the deployer, immediately after deploym
 | `has_completed(student, course_id)` | `bool` |
 | `verify_certificate(certificate_id)` | `bool` — true if exists and not revoked |
 | `get_platform_fee(admin)` | `u32` — current default fee % (admin only) |
+| `get_approved_token(token)` | `bool` — true if `token` is in the approved-token set; no auth required |
+
+`get_approved_token(token)` is a read-only query: it takes no caller argument,
+performs no `require_auth()`, and never mutates storage. It returns `true` for
+tokens added with `add_approved_token`, `false` for tokens removed with
+`remove_approved_token`, and `false` for tokens that were never configured.
+
+```bash
+stellar contract invoke \
+  --id <CONTRACT_ID> \
+  --network testnet \
+  -- get_approved_token \
+  --token <TOKEN_SAC_ADDRESS>
+```
+
+### Approved-token requirements
+
+`add_approved_token` only accepts standard Stellar Asset Contract (SAC) tokens
+with exactly 7 decimals. Tokens that do not meet those assumptions are rejected
+and the approved-token set is left unchanged — a rejected call never adds,
+removes, or rewrites an entry. Check a token with `get_approved_token` before
+relying on it in a course.
+
+### Default fee and existing courses
+
+`update_default_fee` changes the fee used for **newly registered** courses only.
+Each course stores its own `platform_fee_percent` at registration time, and that
+value is never rewritten when the default changes. Courses registered before a
+default-fee update keep the fee they were registered with; courses registered
+afterwards pick up the new default (unless they set a per-course override).
+=======
 
 ---
 
@@ -447,7 +478,21 @@ set -a; source .env; set +a
 cargo test
 cargo test -- --nocapture          # with output
 cargo test test_full_lifecycle     # single test
+
+# Contract package only (recommended for validation)
+cargo test -p sorobanlard
+
+# Focused regression tests
+cargo test -p sorobanlard test_default_fee
+cargo test -p sorobanlard test_get_approved_token
+cargo test -p sorobanlard test_issue_certificate_rejects_duplicate_id
 ```
+
+`test_default_fee` registers courses before and after a default-fee update and
+asserts existing course terms are not rewritten. `test_get_approved_token`
+covers added, removed, and unconfigured tokens. The
+`test_issue_certificate_rejects_duplicate_id` test reuses a certificate ID and
+asserts the original record and index are preserved.
 
 Expected:
 ```
@@ -597,6 +642,9 @@ stellar contract invoke \
 - **Admin is a single address**: For production, consider using a multi-sig wallet as the admin address to avoid a single point of failure. Privileged operations need both `admin` and `secondary_admin`, so each role should be a separate multisig. See [docs/admin-key-management.md](docs/admin-key-management.md) for the pattern and init-time rules.
 - **Pre-launch and upgrades**: Review [MAINNET_CHECKLIST.md](MAINNET_CHECKLIST.md) before deploying to mainnet, and rehearse every upgrade with [docs/upgrade-runbook.md](docs/upgrade-runbook.md).
 - **Fee validation**: Platform fee percentage is validated to be ≤ 100 at both `init` and `register_course` time.
+- **Default-fee changes are not retroactive**: `update_default_fee` affects only courses registered afterwards; each course keeps the `platform_fee_percent` it was registered with.
+- **Approved tokens**: Only standard SAC tokens with 7 decimals are accepted by `add_approved_token`; unsupported tokens are rejected without changing the approved-token set. Use the read-only `get_approved_token` query to inspect configuration.
+- **Certificate ID uniqueness**: `issue_certificate` rejects a `cert_id` that already exists, preserving the original certificate and avoiding duplicate index entries.
 
 ---
 
@@ -715,3 +763,15 @@ MIT
 
 <!-- handsoff-issue-146 -->
 - #146: Add invariant tests for accounting and multi-sig safety
+
+<!-- handsoff-issue-76 -->
+- #76: Test default-fee changes apply consistently to newly registered courses
+
+<!-- handsoff-issue-79 -->
+- #79: Add a read-only query for approved token configuration
+
+<!-- handsoff-issue-80 -->
+- #80: Test approved-token validation for unsupported asset contracts
+
+<!-- handsoff-issue-81 -->
+- #81: Test certificate issuance rejects duplicate certificate identifiers

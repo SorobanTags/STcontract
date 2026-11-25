@@ -27,6 +27,27 @@ Convention:
 ### Added
 
 - CHANGELOG tracking contract version history and upgrade hashes.
+- Read-only `get_approved_token` query to inspect whether a token is on the
+  approved SAC allowlist, without exposing mutable storage. Covers added,
+  removed, and never-configured tokens.
+
+### Changed
+
+- Documented that `update_default_fee` only affects courses registered after
+  the update: existing course terms (including their platform fee) are never
+  silently rewritten.
+
+### Fixed
+
+- `approve_token` rejects asset contracts that do not meet the documented SAC
+  and seven-decimal assumptions, leaving the approved-token set unchanged.
+- Certificate issuance rejects duplicate certificate identifiers, preserving
+  the original record and avoiding duplicate index entries.
+
+### Validation
+
+- Run `cargo test -p sorobanlard` to exercise the regression tests for the
+  above behaviors.
 
 ## [0.1.0] - Initial tracked release
 

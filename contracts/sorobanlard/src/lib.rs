@@ -4174,6 +4174,14 @@ impl SorobanLardContract {
     /// Rejects a `new_fee_pct` that is identical to the currently stored
     /// value. A no-op update wastes ledger fees and emits a misleading
     /// fee-change event that could confuse off-chain monitors. (#175)
+    ///
+    /// # Scope — new registrations only
+    ///
+    /// This writes only `DataKey::DefaultFee` (instance storage). It never
+    /// rewrites stored `Course` records, so courses registered before the
+    /// update keep the fee they were registered with. The new default applies
+    /// to courses registered after this call. See
+    /// `test_default_fee_change_applies_only_to_new_courses`.
     pub fn update_default_fee(env: Env, admin: Address, new_fee_pct: u32) {
         admin.require_auth();
         Self::require_admin(&env, &admin, "update_default_fee");
@@ -4230,6 +4238,11 @@ impl SorobanLardContract {
     ///
     /// See INVARIANTS.md (token assumptions) and
     /// `test_reconciliation_instructor_earnings_match_contract_balance`.
+    ///
+    /// A token that fails `validate_token_interface` (not a SAC-style
+    /// seven-decimal token) is rejected before the flag is written, so the
+    /// approved-token set is unchanged. Use `get_approved_token` to inspect
+    /// the set without mutating it.
     pub fn add_approved_token(env: Env, admin: Address, token: Address) {
         admin.require_auth();
         Self::require_admin(&env, &admin, "add_approved_token");
@@ -4287,6 +4300,24 @@ impl SorobanLardContract {
         Self::is_btc_eth_token_internal(&env, &token)
     }
 
+    /// Read-only query: is `token` currently on the approved-token list?
+    ///
+    /// Returns `true` when `DataKey::ApprovedToken(token)` is set in instance
+    /// storage, `false` otherwise (including for tokens that were never
+    /// approved or have since been removed via `remove_approved_token`).
+    /// Requires no auth and never mutates state — it only reads the flag and
+    /// extends the instance TTL like the other getters, so off-chain systems
+    /// can inspect the approved set without a mutable storage handle.
+    pub fn get_approved_token(env: Env, token: Address) -> bool {
+        env.storage()
+            .instance()
+            .extend_ttl(Self::INSTANCE_TTL_THRESHOLD, Self::INSTANCE_TTL_EXTEND_TO);
+        env.storage()
+            .instance()
+            .get(&DataKey::ApprovedToken(token))
+            .unwrap_or(false)
+    }
+
     /// Returns the number of enrollments a student has ever created on the
     /// platform. Zero means their next enrollment is as a new customer.
     pub fn get_student_enrollment_count(env: Env, student: Address) -> u32 {
@@ -4294,6 +4325,9 @@ impl SorobanLardContract {
     }
 
     /// Admin removes a token contract address from the enrollment whitelist.
+    ///
+    /// After removal `get_approved_token` returns `false` for `token` and any
+    /// BTC/ETH classification for it is cleared as well.
     pub fn remove_approved_token(env: Env, admin: Address, token: Address) {
         admin.require_auth();
         Self::require_admin(&env, &admin, "remove_approved_token");

@@ -1418,6 +1418,63 @@ fn test_update_platform_fee() {
     assert_eq!(client.get_platform_fee(&admin), 25);
 }
 
+// ============================================================
+// ISSUE #76 — default fee changes apply only to newly registered courses
+// ============================================================
+
+#[test]
+fn test_default_fee_change_does_not_rewrite_existing_course() {
+    let (env, contract_id, token_id, admin, _sec_admin, treasury, instructor) = setup();
+    let client = SorobanLardContractClient::new(&env, &contract_id);
+    let token_client = token::Client::new(&env, &token_id);
+
+    // Course A is registered while the default fee is 20%.
+    let course_a = String::from_str(&env, "COURSE-FEE-A");
+    register_and_approve_course(
+        &env,
+        &client,
+        &token_id,
+        &admin,
+        &instructor,
+        "COURSE-FEE-A",
+        1_000_000_000,
+    );
+    assert_eq!(client.get_course(&course_a).unwrap().platform_fee_percent, 20);
+
+    // Admin raises the default fee to 30%.
+    client.update_default_fee(&admin, &30u32);
+    assert_eq!(client.get_platform_fee(&admin), 30);
+
+    // Course A keeps the fee it was registered with.
+    assert_eq!(client.get_course(&course_a).unwrap().platform_fee_percent, 20);
+
+    // Course B registered after the update picks up the new default.
+    let course_b = String::from_str(&env, "COURSE-FEE-B");
+    register_and_approve_course(
+        &env,
+        &client,
+        &token_id,
+        &admin,
+        &instructor,
+        "COURSE-FEE-B",
+        1_000_000_000,
+    );
+    assert_eq!(client.get_course(&course_b).unwrap().platform_fee_percent, 30);
+
+    // Enrolling in course A charges the original 20% split, not 30%.
+    let student = Address::generate(&env);
+    token::StellarAssetClient::new(&env, &token_id).mint(&student, &10_000_000_000);
+    client.enroll(&student, &course_a);
+
+    let price: i128 = 1_000_000_000;
+    let expected_platform_share = price * 20 / 100;
+    assert_eq!(token_client.balance(&treasury), expected_platform_share);
+    assert_eq!(
+        client.get_instructor_earnings(&instructor, &token_id),
+        price - expected_platform_share,
+    );
+}
+
 #[test]
 fn test_multiple_students_same_course() {
     let (env, contract_id, token_id, admin, sec_admin, _treasury, instructor) = setup();
@@ -13963,6 +14020,231 @@ fn test_add_approved_token_rejects_negative_balance() {
 
     let bad_token = env.register(negative_balance_token::NegativeBalanceToken, ());
     client.add_approved_token(&admin, &bad_token);
+}
+
+// ============================================================
+// ISSUE #79 — read-only approved-token query
+// ============================================================
+
+#[test]
+fn test_get_approved_token_reflects_added_and_removed_tokens() {
+    let (env, contract_id, token_id, admin, _sec_admin, _treasury, _instructor) = setup();
+    let client = SorobanLardContractClient::new(&env, &contract_id);
+
+    // The token added during setup is approved.
+    assert!(client.get_approved_token(&token_id));
+
+    // A freshly registered SAC token is not approved until added.
+    let new_token = env
+        .register_stellar_asset_contract_v2(Address::generate(&env))
+        .address();
+    assert!(!client.get_approved_token(&new_token));
+
+    client.add_approved_token(&admin, &new_token);
+    assert!(client.get_approved_token(&new_token));
+
+    client.remove_approved_token(&admin, &new_token);
+    assert!(!client.get_approved_token(&new_token));
+
+    // Removing the setup token flips it to false as well.
+    client.remove_approved_token(&admin, &token_id);
+    assert!(!client.get_approved_token(&token_id));
+}
+
+#[test]
+fn test_get_approved_token_returns_false_for_unconfigured_address() {
+    let (env, contract_id, _token_id, _admin, _sec_admin, _treasury, _instructor) = setup();
+    let client = SorobanLardContractClient::new(&env, &contract_id);
+
+    let never_seen = Address::generate(&env);
+    assert!(!client.get_approved_token(&never_seen));
+}
+
+#[test]
+fn test_get_approved_token_is_read_only() {
+    let (env, contract_id, token_id, admin, _sec_admin, _treasury, _instructor) = setup();
+    let client = SorobanLardContractClient::new(&env, &contract_id);
+
+    let new_token = env
+        .register_stellar_asset_contract_v2(Address::generate(&env))
+        .address();
+    client.add_approved_token(&admin, &new_token);
+
+    // Querying must not require auth and must not mutate the approved set.
+    env.set_auths(&[]);
+    assert!(client.get_approved_token(&new_token));
+    assert!(client.get_approved_token(&token_id));
+    assert!(!client.get_approved_token(&Address::generate(&env)));
+
+    // The set is unchanged: the query still reports the same values.
+    env.mock_all_auths();
+    assert!(client.get_approved_token(&new_token));
+    assert!(client.get_approved_token(&token_id));
+}
+
+// ============================================================
+// ISSUE #80 — rejected approvals leave the approved set unchanged
+// ============================================================
+
+#[test]
+#[should_panic(expected = "invalid token: decimals() call failed")]
+fn test_add_approved_token_rejects_non_contract_address_unchanged() {
+    let (env, contract_id, _token_id, admin, _sec_admin, _treasury, _instructor) = setup();
+    let client = SorobanLardContractClient::new(&env, &contract_id);
+
+    let bad_token = Address::generate(&env);
+    client.add_approved_token(&admin, &bad_token);
+}
+
+#[test]
+fn test_add_approved_token_rejects_non_sac_contract_unchanged() {
+    let (env, contract_id, _token_id, admin, _sec_admin, _treasury, _instructor) = setup();
+    let client = SorobanLardContractClient::new(&env, &contract_id);
+
+    let not_a_token = env.register(not_a_token::NotATokenContract, ());
+    let res = client.try_add_approved_token(&admin, &not_a_token);
+    assert!(res.is_err(), "non-SAC contract must be rejected");
+    assert!(!client.get_approved_token(&not_a_token));
+}
+
+#[test]
+fn test_add_approved_token_rejects_wrong_decimals_unchanged() {
+    let (env, contract_id, _token_id, admin, _sec_admin, _treasury, _instructor) = setup();
+    let client = SorobanLardContractClient::new(&env, &contract_id);
+
+    let bad_token = env.register(wrong_decimals_token::WrongDecimalsToken, ());
+    let res = client.try_add_approved_token(&admin, &bad_token);
+    assert!(res.is_err(), "non-7-decimal token must be rejected");
+    assert!(!client.get_approved_token(&bad_token));
+}
+
+#[test]
+fn test_add_approved_token_rejects_trapping_balance_unchanged() {
+    let (env, contract_id, _token_id, admin, _sec_admin, _treasury, _instructor) = setup();
+    let client = SorobanLardContractClient::new(&env, &contract_id);
+
+    let bad_token = env.register(broken_balance_token::BrokenBalanceToken, ());
+    let res = client.try_add_approved_token(&admin, &bad_token);
+    assert!(res.is_err(), "token with trapping balance() must be rejected");
+    assert!(!client.get_approved_token(&bad_token));
+}
+
+#[test]
+fn test_add_approved_token_rejects_negative_balance_unchanged() {
+    let (env, contract_id, _token_id, admin, _sec_admin, _treasury, _instructor) = setup();
+    let client = SorobanLardContractClient::new(&env, &contract_id);
+
+    let bad_token = env.register(negative_balance_token::NegativeBalanceToken, ());
+    let res = client.try_add_approved_token(&admin, &bad_token);
+    assert!(res.is_err(), "token with negative balance() must be rejected");
+    assert!(!client.get_approved_token(&bad_token));
+}
+
+// ============================================================
+// ISSUE #81 — duplicate certificate identifiers are rejected
+// ============================================================
+
+#[test]
+fn test_issue_certificate_rejects_duplicate_id() {
+    let (env, contract_id, token_id, admin, _sec_admin, _treasury, instructor) = setup();
+    let client = SorobanLardContractClient::new(&env, &contract_id);
+
+    register_and_approve_course(
+        &env,
+        &client,
+        &token_id,
+        &admin,
+        &instructor,
+        "COURSE-DUP-CERT-A",
+        300_000_000,
+    );
+    register_and_approve_course(
+        &env,
+        &client,
+        &token_id,
+        &admin,
+        &instructor,
+        "COURSE-DUP-CERT-B",
+        300_000_000,
+    );
+
+    let course_a = String::from_str(&env, "COURSE-DUP-CERT-A");
+    let course_b = String::from_str(&env, "COURSE-DUP-CERT-B");
+    let cert_id = String::from_str(&env, "CERT-DUP-ID");
+
+    // Student A completes course A and receives the certificate.
+    let student_a = Address::generate(&env);
+    token::StellarAssetClient::new(&env, &token_id).mint(&student_a, &1_000_000_000);
+    client.enroll(&student_a, &course_a);
+    client.mark_completed(
+        &admin,
+        &student_a,
+        &course_a,
+        &Some(String::from_str(&env, "ev_a")),
+    );
+    client.issue_certificate(
+        &admin,
+        &student_a,
+        &course_a,
+        &cert_id,
+        &String::from_str(&env, "Course A"),
+        &get_enrollment_ref(&env, &client, &student_a, "COURSE-DUP-CERT-A"),
+        &None,
+        &None,
+    );
+
+    let original = client.get_certificate(&student_a, &cert_id);
+
+    // Student B completes course B and tries to reuse the same certificate ID.
+    let student_b = Address::generate(&env);
+    token::StellarAssetClient::new(&env, &token_id).mint(&student_b, &1_000_000_000);
+    client.enroll(&student_b, &course_b);
+    client.mark_completed(
+        &admin,
+        &student_b,
+        &course_b,
+        &Some(String::from_str(&env, "ev_b")),
+    );
+    let res = client.try_issue_certificate(
+        &admin,
+        &student_b,
+        &course_b,
+        &cert_id,
+        &String::from_str(&env, "Course B"),
+        &get_enrollment_ref(&env, &client, &student_b, "COURSE-DUP-CERT-B"),
+        &None,
+        &None,
+    );
+    assert!(res.is_err(), "duplicate certificate ID must be rejected");
+
+    // The original record is preserved unchanged.
+    let after = client.get_certificate(&student_a, &cert_id);
+    assert_eq!(after, original);
+    assert_eq!(after.student, student_a);
+    assert_eq!(after.course_id, course_a);
+
+    // No certificate was created for student B under that ID.
+    assert!(!client.verify_certificate_for_student(&student_b, &cert_id));
+
+    // The student's certificate index contains exactly one entry for the ID.
+    let student_certs = client.get_student_certificates(&student_a);
+    let mut matches = 0u32;
+    for id in student_certs.iter() {
+        if id == cert_id {
+            matches += 1;
+        }
+    }
+    assert_eq!(matches, 1, "student index must hold exactly one entry");
+
+    // The course's certificate index also contains exactly one entry.
+    let course_certs = client.get_course_certificates(&course_a);
+    let mut course_matches = 0u32;
+    for id in course_certs.iter() {
+        if id == cert_id {
+            course_matches += 1;
+        }
+    }
+    assert_eq!(course_matches, 1, "course index must hold exactly one entry");
 }
 
 // ============================================================
