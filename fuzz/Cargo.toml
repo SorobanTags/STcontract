@@ -19,5 +19,12 @@ test = false
 doc = false
 bench = false
 
+[[bin]]
+name = "mark_completed"
+path = "fuzz_targets/mark_completed.rs"
+test = false
+doc = false
+bench = false
+
 # Keep this crate out of the root workspace, which only lists contracts/*.
 [workspace]

@@ -38,11 +38,19 @@ def public_functions(source):
         name = match.group(1)
         header = []
         cursor = index
-        while True:
+        while cursor < len(lines):
             header.append(lines[cursor])
             if lines[cursor].rstrip().endswith("{"):
                 break
             cursor += 1
+        else:
+            # cursor walked past end of file without finding a closing `{`
+            print(
+                f"::error file=contracts/sorobanlard/src/lib.rs,line={index + 1}::"
+                f"lib.rs:{index + 1}: pub fn `{name}` header never terminated by a "
+                f"line ending in '{{' (unterminated signature)"
+            )
+            sys.exit(1)
         signature = " ".join(header)
         params = signature[signature.index("(") + 1 : signature.rindex(")")]
 
