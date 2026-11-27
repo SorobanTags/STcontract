@@ -4433,6 +4433,39 @@ fn test_blocked_student_cannot_enroll() {
 }
 
 #[test]
+fn test_blocked_student_cannot_mark_completed() {
+    let (env, contract_id, token_id, admin, _sec_admin, _treasury, instructor) = setup();
+    let client = SorobanLardContractClient::new(&env, &contract_id);
+    let student = Address::generate(&env);
+    token::StellarAssetClient::new(&env, &token_id).mint(&student, &1_000_000_000);
+
+    register_and_approve_course(
+        &env,
+        &client,
+        &token_id,
+        &admin,
+        &instructor,
+        "BLOCKED-COMPLETION-COURSE",
+        100_000_000,
+    );
+    let course_id = String::from_str(&env, "BLOCKED-COMPLETION-COURSE");
+    client.enroll(&student, &course_id);
+
+    client.block_student(&admin, &student);
+    let evidence = Some(String::from_str(&env, "valid-evidence-hash"));
+    let blocked_result = client.try_mark_completed(&admin, &student, &course_id, &evidence);
+    assert!(
+        blocked_result.is_err(),
+        "expected the documented `student is blocked and cannot proceed` rejection"
+    );
+
+    client.unblock_student(&admin, &student);
+    assert!(client
+        .try_mark_completed(&admin, &student, &course_id, &evidence)
+        .is_ok());
+}
+
+#[test]
 #[should_panic(expected = "instructor is frozen")]
 fn test_frozen_instructor_cannot_register_course() {
     let (env, contract_id, token_id, admin, _sec_admin, _treasury, instructor) = setup();
@@ -10075,6 +10108,77 @@ fn test_get_certificate_denies_third_party_even_with_student_auth() {
     // of `cert.student.require_auth()` would have let this through.
     let third_party = Address::generate(&env);
     client.get_certificate(&third_party, &cert_id);
+}
+
+#[test]
+#[should_panic(expected = "unauthorized")]
+fn test_get_certificate_third_party_rejected_with_scoped_auth() {
+    let (env, contract_id, token_id, admin, _sec_admin, _treasury, instructor) = setup();
+    let client = SorobanLardContractClient::new(&env, &contract_id);
+
+    let student = Address::generate(&env);
+    let third_party = Address::generate(&env);
+    token::StellarAssetClient::new(&env, &token_id).mint(&student, &100_000_000_000);
+
+    register_and_approve_course(
+        &env,
+        &client,
+        &token_id,
+        &admin,
+        &instructor,
+        "COURSE-CERT-SCOPED-AUTH",
+        500_000_000,
+    );
+    let course_id = String::from_str(&env, "COURSE-CERT-SCOPED-AUTH");
+    client.enroll(&student, &course_id);
+    client.mark_completed(
+        &admin,
+        &student,
+        &course_id,
+        &Some(String::from_str(&env, "evidence")),
+    );
+
+    let cert_id = String::from_str(&env, "CERT-SCOPED-AUTH");
+    client.issue_certificate(
+        &admin,
+        &student,
+        &course_id,
+        &cert_id,
+        &String::from_str(&env, "Scoped Auth Course"),
+        &String::from_str(&env, "backend-ref-scoped-auth"),
+        &None,
+        &None,
+    );
+
+    // The student's auth is scoped to this exact invocation; it must not
+    // authorize a third-party caller.
+    let args = (third_party.clone(), cert_id.clone()).into_val(&env);
+    let result = client
+        .mock_auths(&[MockAuth {
+            address: &student,
+            invoke: &MockAuthInvoke {
+                contract: &contract_id,
+                fn_name: "get_certificate",
+                args,
+                sub_invokes: &[],
+            },
+        }])
+        .try_get_certificate(&third_party, &cert_id);
+    assert!(result.is_err(), "student auth must not authorize third party");
+
+    // Authenticate the third-party caller so this invocation reaches the
+    // caller-role guard. Removing that guard makes this call succeed.
+    client
+        .mock_auths(&[MockAuth {
+            address: &third_party,
+            invoke: &MockAuthInvoke {
+                contract: &contract_id,
+                fn_name: "get_certificate",
+                args: (third_party.clone(), cert_id.clone()).into_val(&env),
+                sub_invokes: &[],
+            },
+        }])
+        .get_certificate(&third_party, &cert_id);
 }
 
 #[test]
