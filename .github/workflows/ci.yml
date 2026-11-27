@@ -207,3 +207,15 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - name: Run property-based accounting tests
         run: PROPTEST_CASES=1024 cargo test -p sorobanlard proptests
+
+  fuzz-build:
+    name: Fuzz targets build check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Build fuzz crate (compile check only)
+        run: cargo build --manifest-path fuzz/Cargo.toml --target x86_64-unknown-linux-gnu

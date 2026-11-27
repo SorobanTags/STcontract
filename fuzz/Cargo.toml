@@ -20,6 +20,13 @@ doc = false
 bench = false
 
 [[bin]]
+name = "mark_completed"
+path = "fuzz_targets/mark_completed.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
 name = "withdraw_earnings"
 path = "fuzz_targets/withdraw_earnings.rs"
 test = false

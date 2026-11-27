@@ -30,7 +30,7 @@ CONTRACT_NAME = sorobanlard
 WASM_PATH     = target/wasm32v1-none/release/$(CONTRACT_NAME).wasm
 WASM_OPT      = target/wasm32v1-none/release/$(CONTRACT_NAME).optimized.wasm
 
-.PHONY: test build optimize deploy-testnet clean fmt check check-api verify-revoked
+.PHONY: test build optimize deploy-testnet clean fmt check check-api verify-revoked fuzz
 
 # Run the contract's Rust test suite via `cargo test`.
 test:
@@ -97,3 +97,7 @@ check-api:
 # Remove build artifacts with `cargo clean`.
 clean:
 	cargo clean
+
+# Build all fuzz targets to verify they compile (does not run the fuzzer).
+fuzz:
+	cargo build --manifest-path ../../fuzz/Cargo.toml --target x86_64-unknown-linux-gnu
