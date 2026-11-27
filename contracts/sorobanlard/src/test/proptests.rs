@@ -379,6 +379,48 @@ proptest! {
         );
     }
 
+    /// An approved refund restores the platform (treasury) and instructor
+    /// splits exactly: each party's token balance returns to its pre-enrollment
+    /// value.
+    #[test]
+    fn prop_process_refund_restores_balances(
+        price in course_price(),
+        token_fee in fee_bps(),
+        course_fee_pct in 0u32..=100,
+    ) {
+        if price == 0 {
+            return Ok(());
+        }
+        let e = enroll_with(price, token_fee, course_fee_pct);
+        let client = SorobanLardContractClient::new(&e.env, &e.contract_id);
+        let token_client = token::Client::new(&e.env, &e.token_id);
+
+        // Snapshot balances immediately after enrollment so we know exactly
+        // how much each party received. The pre-enrollment values are these
+        // minus the enrollment split (all parties started at 0 before the
+        // enrollment in the fresh env, so the pre-enrollment values are 0).
+        let enrollment = client
+            .get_enrollment(&e.student, &e.student, &e.course_id)
+            .unwrap();
+        let treasury_pre = token_client.balance(&e.treasury) - enrollment.platform_amount;
+        let instructor_pre = client.get_instructor_earnings(&e.instructor, &e.token_id)
+            - enrollment.instructor_amount;
+
+        client.request_refund(&e.student, &e.course_id);
+        e.env.mock_all_auths_allowing_non_root_auth();
+        client.process_refund(&e.admin, &e.student, &e.course_id, &true);
+
+        prop_assert_eq!(token_client.balance(&e.treasury), treasury_pre,
+            "treasury balance should be restored to pre-enrollment value");
+        prop_assert_eq!(
+            client.get_instructor_earnings(&e.instructor, &e.token_id),
+            instructor_pre,
+            "instructor earnings should be restored to pre-enrollment value"
+        );
+        prop_assert_eq!(token_client.balance(&e.student), e.student_start,
+            "student balance should be restored to pre-enrollment value");
+    }
+
     /// A zero per-course fee override means "inherit the global default",
     /// not "free": for any price and default rate, a course registered with
     /// `Some(0)` must charge exactly the same split as one registered with
@@ -441,6 +483,7 @@ proptest! {
             client.get_instructor_earnings(&instructor, &token_id),
             enrollment_zero.instructor_amount
         );
+    }
     }
 
     /// An approved refund returns exactly what was paid: the student is made
