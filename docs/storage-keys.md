@@ -93,6 +93,26 @@ by users, courses, enrollments, or certificates must be persistent.
 | `DataKey2::HighValueCourseThreshold` | Instance | Singleton global config. |
 | `DataKey2::HighValueCourseApproval(String)` | Instance | Short-lived per-course co-signature state (transient governance step). |
 
+## Revocation challenge queries
+
+`get_revocation_challenge` is a read-only view. It reads the existing
+certificate record and the `RevocationChallengePeriod` config to derive the
+challenge status and deadline; it does not write any new storage keys, so no
+additional entry appears in the classification table above. Because it only
+reads, it is safe to call from off-chain clients and does not extend or create
+TTLs beyond what the read path already does.
+
+## Approved token removal
+
+Removing an `ApprovedToken(Address)` entry (via the admin token-removal path)
+only affects **new** enrollment validation: subsequent `enroll` calls that
+reference the removed token are rejected. Removal does **not** delete or mutate
+existing records — `Enrollment`, `EnrollmentHistory`, `InstructorEarnings`,
+`InstructorTotalEarnings`, `InstructorStats`, and `RefundRequest` entries for
+courses already paid in that token remain intact, and existing refund and
+withdrawal paths continue to operate against those records. The removal is a
+single instance-storage flag delete; no persistent per-entity data is touched.
+
 ## Platform counter race-freedom
 
 `TotalActiveEnrollments` is an instance-storage counter, not a persistent

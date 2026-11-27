@@ -73,6 +73,26 @@ Every multi-sig operation requires both `Admin` and `SecondaryAdmin`. A single k
 A second call to `init` is rejected, so `init` cannot be used to overwrite admin, treasury or fee configuration.
 - Enforced in: `init`
 - Tests: `test_invariant_inv10_init_only_once`
+
+### INV-11 — A zero per-course fee override inherits the global default
+A `FeeConfig` override of `0` bps is not an explicit free override. The effective fee falls back to `DefaultFee`; only a non-zero override acts as a floor. Preview and enrollment agree.
+- Enforced in: `compute_fee_breakdown`, `deduct_fee`
+- Tests: `test_invariant_inv11_zero_fee_override_inherits_default`, `test_zero_fee_override_charges_default_fee_on_enroll`, `test_zero_fee_override_preview_matches_enroll`
+
+### INV-12 — Revocation challenge period boundaries
+`challenge_revocation` succeeds only while `ledger < revocation_deadline`. At and after the deadline the revocation is final and `Certificate.revoked` never returns to `false`.
+- Enforced in: `challenge_revocation`, `apply_revocation`
+- Tests: `test_invariant_inv12_challenge_period_boundaries`
+
+### INV-13 — Certificate expiry boundary
+`verify_certificate` returns `true` only while `ledger < expires_at_ledger`; at and after `expires_at_ledger` it returns `false`. Expiry does not mutate the stored certificate.
+- Enforced in: `verify_certificate`
+- Tests: `test_invariant_inv13_certificate_expiry_boundary`
+
+### INV-14 — Issuance requires a valid instructor signature
+An authorized admin `issue_certificate` call with a missing or mismatched instructor signature is rejected: no `Certificate` record is written and no certificate-issued event is emitted.
+- Enforced in: `issue_certificate`
+- Tests: `test_invariant_inv14_issuance_rejects_bad_instructor_signature`, `test_issue_certificate_missing_instructor_signature_leaves_no_record`
 ## Detailed audit model
 
 This is the list of financial and state-machine invariants the SorobanLard
@@ -116,6 +136,7 @@ and in the crate-level *Token Assumptions* section of `lib.rs`.
 | ID | Invariant | Enforced by | Tests | Status |
 |----|-----------|-------------|-------|--------|
 | F1 | **Split is exact.** For every enrollment, `platform_amount + instructor_amount == amount_paid`, with both `>= 0`. | `deduct_fee` returns `(amount - fee, fee)`; free courses give `(0, 0)`. | `test_enroll_success_with_payment_split`, `test_fee_preview_matches_actual_enroll_deduction`, `test_enroll_fee_honors_registered_override_as_floor`, `test_enroll_zero_price_free_course` | ✅ |
+| F1a | **A zero per-course fee override means "inherit".** A `FeeConfig` override of `0` bps is not an explicit free override: the effective fee falls back to the global `DefaultFee`. Only a non-zero override acts as a floor. | `compute_fee_breakdown` / `deduct_fee` treat `override == 0` as absent and read `DefaultFee`. | `test_invariant_inv11_zero_fee_override_inherits_default`, `test_zero_fee_override_charges_default_fee_on_enroll`, `test_zero_fee_override_preview_matches_enroll` | ✅ |
 | F2 | **Course revenue accounting.** For every course, `Course.total_earned == Σ (platform_amount + instructor_amount)` over every enrollment ever created for it: the active record plus every `EnrollmentHistory` entry, refunded ones included. `total_earned` is gross revenue, so refunds do not decrement it. | `enroll_internal`, `enroll_internal_validated` and `re_enroll` add `course.price` alongside an enrollment whose split sums to `course.price`; no other function writes `total_earned`. | `test_enroll_success_with_payment_split`, `test_multiple_students_same_course`, `test_enroll_total_earned_overflow`, `test_enroll_rolls_back_when_second_split_transfer_fails` | 🟡 No test sums over history after refunds and re-enrollments. |
 | F3 | **No enrollment without confirmed payment.** An `Enrollment` with `amount_paid > 0` exists only if the contract received exactly `course.price` from the student in the same invocation. | Balance-delta check in `enroll_internal` (`"token transfer amount mismatch"`). Soroban atomicity reverts the enrollment if any transfer panics. | `test_enroll_insufficient_funds_rollback`, `test_enroll_rejects_fee_on_transfer_token`, `test_enroll_rolls_back_when_second_split_transfer_fails` | 🟡 `re_enroll` and `enroll_internal_validated` (batch) have the same check but no dedicated test. |
 | F4 | **Earnings are backed by funds.** For every approved token, `token.balance(contract) >= Σ_instructors InstructorEarnings(instructor, token)`. Equality holds when no arbitration fees are held, no unsolicited transfers were received, and `withdraw_tokens` was not used. | Credit only after the student → contract transfer; debit before the contract → recipient transfer in `withdraw_earnings`, `process_refund` and `archive_course`. | `test_reconciliation_instructor_earnings_match_contract_balance` | ⚠️ `withdraw_tokens` can sweep earnings-backed funds (FU-1). |
@@ -161,9 +182,11 @@ and in the crate-level *Token Assumptions* section of `lib.rs`.
 | ID | Invariant | Enforced by | Tests | Status |
 |----|-----------|-------------|-------|--------|
 | R1 | **Certificate IDs are unique.** | `issue_certificate` (`"certificate ID already exists"`). | `test_certificate_id_collision_across_courses`, `test_course_certificate_id_collision_verification` | ✅ |
-| R2 | **Revocation is permanent once the challenge deadline passes.** `Certificate.revoked` may only go from `true` back to `false` through `challenge_revocation`, by the holder, while `ledger < revocation_deadline`. After that it never flips back. | `apply_revocation` is the only writer of `true`; `challenge_revocation` is the only writer of `false` and enforces the deadline. | `test_issue_146_revocation_becomes_permanent_after_deadline`, `test_issue_146_late_challenge_fails`, `test_issue_146_challenge_boundary_condition`, `test_issue_146_unauthorized_challenge_fails`, `test_revoke_certificate_id_cannot_be_reused_to_unrevoke`, `test_revoke_certificate_double_revocation_rejected` | ✅ |
+| R2 | **Revocation is permanent once the challenge deadline passes.** `Certificate.revoked` may only go from `true` back to `false` through `challenge_revocation`, by the holder, while `ledger < revocation_deadline`. After that it never flips back. The boundary is exclusive: a challenge at exactly `revocation_deadline` is rejected, and revocation state changes only for `ledger < revocation_deadline`. | `apply_revocation` is the only writer of `true`; `challenge_revocation` is the only writer of `false` and enforces the deadline. | `test_issue_146_revocation_becomes_permanent_after_deadline`, `test_issue_146_late_challenge_fails`, `test_issue_146_challenge_boundary_condition`, `test_issue_146_unauthorized_challenge_fails`, `test_revoke_certificate_id_cannot_be_reused_to_unrevoke`, `test_revoke_certificate_double_revocation_rejected`, `test_invariant_inv12_challenge_period_boundaries` | ✅ |
 | R3 | **Revoked certificates are never deleted**, and revocation metadata (`revoked_by`, `revocation_ledger`, `revocation_reason`) is set together with `revoked`. | `apply_revocation`. | `test_revoke_certificate_metadata_persisted`, `test_revoke_certificate_metadata_unchanged_after_rejected_double_revoke`, `test_certificate_issued_by_persists_after_revocation` | ✅ |
 | R4 | **`certificates_issued <= max_certificates`** when set, and `course.certificates_issued == len(CourseCertificates(course_id))`. | `issue_certificate`. | — | ❌ (FU-10) |
+| R5 | **Certificates expire at the ledger boundary.** `verify_certificate` returns `true` only while `ledger < expires_at_ledger`; at and after `expires_at_ledger` it returns `false`. Expiry does not mutate the stored certificate. | `verify_certificate` expiry check. | `test_invariant_inv13_certificate_expiry_boundary` | ✅ |
+| R6 | **Issuance requires a valid instructor signature.** An authorized admin `issue_certificate` call with a missing or mismatched instructor signature is rejected: no `Certificate` record is written and no certificate-issued event is emitted. | `issue_certificate` signature verification. | `test_invariant_inv14_issuance_rejects_bad_instructor_signature`, `test_issue_certificate_missing_instructor_signature_leaves_no_record` | ✅ |
 
 ---
 

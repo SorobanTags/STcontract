@@ -153,6 +153,35 @@ proptest! {
         }
     }
 
+    /// For every generated `(amount, bps, override_bps)` with `amount >= 0`,
+    /// neither the platform fee nor the instructor share ever exceeds `amount`,
+    /// and the two shares always sum to `amount`.
+    #[test]
+    fn prop_deduct_fee_shares_never_exceed_amount(
+        amount in prop_oneof![
+            1 => Just(0i128),
+            1 => Just(1i128),
+            1 => Just(i128::MAX / 10_000),
+            7 => 0i128..=(i128::MAX / 10_000),
+        ],
+        bps in fee_bps(),
+        override_bps in proptest::option::of(0u32..=10_000),
+    ) {
+        let (env, contract_id, token_id, admin, _sec_admin, _treasury, _instructor) = setup();
+        let client = SorobanLardContractClient::new(&env, &contract_id);
+        client.set_fee_config(&admin, &token_id, &bps);
+
+        let (instructor, platform) = env.as_contract(&contract_id, || {
+            SorobanLardContract::deduct_fee(&env, &token_id, amount, override_bps, false, false)
+        });
+
+        prop_assert!(platform >= 0);
+        prop_assert!(instructor >= 0);
+        prop_assert!(platform <= amount);
+        prop_assert!(instructor <= amount);
+        prop_assert_eq!(platform + instructor, amount);
+    }
+
     /// When `amount * fee_bps` cannot be represented in an i128 the fee
     /// computation must panic rather than silently wrap.
     #[test]
@@ -206,6 +235,41 @@ proptest! {
         prop_assert_eq!(client.get_instructor_total_earnings(&e.instructor), instructor);
     }
 
+    /// Issue #77: for prices that are not multiples of 100 the percentage
+    /// split leaves a division remainder. The documented rule is truncation:
+    /// `platform = price * pct / 100` (integer division, remainder dropped),
+    /// and the remainder is retained by the instructor share so that
+    /// `platform + instructor == price` exactly.
+    #[test]
+    fn prop_fee_split_rounding_for_non_hundred_prices(
+        price in (MIN_PRICE..=MAX_PRICE).prop_filter(
+            "price must not be divisible by 100",
+            |p| p % 100 != 0,
+        ),
+        token_fee in fee_bps(),
+        course_fee_pct in 1u32..=100,
+    ) {
+        let e = enroll_with(price, token_fee, course_fee_pct);
+        let client = SorobanLardContractClient::new(&e.env, &e.contract_id);
+
+        let enrollment = client
+            .get_enrollment(&e.student, &e.student, &e.course_id)
+            .unwrap();
+        let platform = enrollment.platform_amount;
+        let instructor = enrollment.instructor_amount;
+
+        // The effective percentage is the course override, floored at the
+        // live per-token rate (mirrors `enroll_with`'s normalisation).
+        let effective_pct = course_fee_pct.max((token_fee + 99) / 100) as i128;
+
+        prop_assert_eq!(enrollment.amount_paid, price);
+        prop_assert_eq!(platform, price * effective_pct / 100);
+        prop_assert_eq!(platform + instructor, price);
+        prop_assert!(platform >= 0 && instructor >= 0);
+        // The remainder (if any) is retained by the instructor share.
+        prop_assert_eq!(instructor, price - price * effective_pct / 100);
+    }
+
     /// `withdraw_earnings()` moves exactly the requested amount (or the full
     /// balance for `amount = 0`), never leaves a negative balance, and
     /// rejects over-withdrawals and negative amounts.
@@ -248,6 +312,70 @@ proptest! {
         prop_assert_eq!(
             client.get_instructor_earnings(&e.instructor, &e.token_id),
             remaining
+        );
+    }
+
+    /// A zero per-course fee override means "inherit the global default",
+    /// not "free": for any price and default rate, a course registered with
+    /// `Some(0)` must charge exactly the same split as one registered with
+    /// `None`, and that split must still conserve value.
+    #[test]
+    fn prop_zero_fee_override_inherits_default(
+        price in course_price(),
+        token_fee in fee_bps(),
+    ) {
+        let e_none = enroll_with(price, token_fee, 0);
+        let client_none = SorobanLardContractClient::new(&e_none.env, &e_none.contract_id);
+        let enrollment_none = client_none
+            .get_enrollment(&e_none.student, &e_none.student, &e_none.course_id)
+            .unwrap();
+
+        // Register a second course with an explicit zero override and the
+        // same default fee configuration.
+        let (env, contract_id, token_id, admin, _sec_admin, treasury, instructor) = setup();
+        let client = SorobanLardContractClient::new(&env, &contract_id);
+        client.set_fee_config(&admin, &token_id, &token_fee);
+
+        let course_id = String::from_str(&env, "PROP-ZERO-OVERRIDE");
+        client.register_course(
+            &instructor,
+            &course_id,
+            &price,
+            &token_id,
+            &0u32,
+            &Some(0u32),
+            &BytesN::from_array(&env, &[2u8; 32]),
+            &soroban_sdk::Vec::new(&env),
+        );
+        env.ledger().with_mut(|l| {
+            l.sequence_number += 1;
+        });
+        client.approve_course(&admin, &course_id);
+
+        let student = Address::generate(&env);
+        if price > 0 {
+            token::StellarAssetClient::new(&env, &token_id).mint(&student, &price);
+        }
+        client.enroll(&student, &course_id);
+
+        let enrollment_zero = client
+            .get_enrollment(&student, &student, &course_id)
+            .unwrap();
+
+        prop_assert_eq!(enrollment_zero.amount_paid, price);
+        prop_assert_eq!(enrollment_zero.platform_amount, enrollment_none.platform_amount);
+        prop_assert_eq!(enrollment_zero.instructor_amount, enrollment_none.instructor_amount);
+        prop_assert_eq!(
+            enrollment_zero.platform_amount + enrollment_zero.instructor_amount,
+            price
+        );
+        prop_assert_eq!(
+            token::Client::new(&env, &token_id).balance(&treasury),
+            enrollment_zero.platform_amount
+        );
+        prop_assert_eq!(
+            client.get_instructor_earnings(&instructor, &token_id),
+            enrollment_zero.instructor_amount
         );
     }
 

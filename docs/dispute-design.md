@@ -44,6 +44,62 @@ typed enum instead of raw byte keys:
 - makes it straightforward to enumerate and reason about what the contract
   stores.
 
+## Certificate revocation challenges
+
+Revoking a certificate is not always final. When a certificate is revoked in
+bulk (for example, revoking every certificate issued for a course), the
+contract records a **pending revocation challenge** for each affected
+certificate. The holder can then contest the revocation before it is finalized.
+
+### Challenge status values
+
+A revocation challenge is modeled with a small, explicit status enum:
+
+- **open** — the revocation has been recorded but the challenge window is still
+  active; the holder may contest it.
+- **completed** — the challenge window has closed (or the challenge was
+  resolved) and the revocation stands.
+
+As with `DisputeStatus`, using an enum instead of free-form flags keeps the
+allowed transitions obvious and prevents invalid combinations.
+
+### Deadline
+
+Each challenge carries a `deadline` field: the ledger timestamp after which an
+open challenge can no longer be contested and transitions to `completed`.
+Integrators should treat the deadline as advisory data and compare it against
+the current ledger time rather than assuming the contract has already flipped
+the status.
+
+### Read-only query: `get_revocation_challenge`
+
+`get_revocation_challenge` exposes the challenge status and deadline as
+read-only data. It does not mutate contract state, so it is safe to call from
+off-chain indexers, UIs, and monitoring jobs. The returned fields are:
+
+- the certificate (or its identifier) the challenge applies to,
+- the current challenge `status` (`open` or `completed`),
+- the `deadline` timestamp for contesting an open challenge.
+
+### Authorization
+
+Reading a challenge is restricted to parties with a legitimate interest:
+
+- the **student holder** of the certificate,
+- the **instructor** who issued the certificate,
+- an **admin** of the contract.
+
+Unauthorized callers are rejected, so challenge state is not disclosed to
+arbitrary third parties.
+
+### Bulk revocation and observation
+
+Bulk revocation creates one pending (open) challenge per revoked certificate,
+so a course-wide revocation leaves every affected holder with a contestable
+challenge. Because `get_revocation_challenge` is read-only, integrators can
+poll it to observe challenge state — open versus completed, and how much time
+remains before the deadline — without ever mutating the contract.
+
 ## Why this lives in `docs/`
 
 Design notes belong under `docs/` with a `.md` extension so GitHub renders them

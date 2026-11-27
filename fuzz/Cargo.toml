@@ -19,5 +19,12 @@ test = false
 doc = false
 bench = false
 
+[[bin]]
+name = "withdraw_earnings"
+path = "fuzz_targets/withdraw_earnings.rs"
+test = false
+doc = false
+bench = false
+
 # Keep this crate out of the root workspace, which only lists contracts/*.
 [workspace]

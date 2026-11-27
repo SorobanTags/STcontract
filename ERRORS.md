@@ -20,6 +20,7 @@ and update the backend mapping in the same PR.
 |--------------------|------------------|--------------|
 | `admin role has expired` | The platform's admin authority has lapsed; the action cannot be performed until admins are rotated. | `403` `ADMIN_EXPIRED` |
 | Unauthorized caller (missing/invalid admin or instructor signature) | You are not allowed to perform this action. | `403` `FORBIDDEN` |
+| `invalid instructor signature` (instructor signature missing or mismatched during certificate issuance) | You are not allowed to issue this certificate; the instructor signature could not be verified. No certificate record is created and no `certificate_issued` event is emitted. | `403` `FORBIDDEN` |
 | `student is blocked` | Your account has been blocked by the platform; you cannot enroll, complete, or receive certificates. | `403` `STUDENT_BLOCKED` |
 | Course not found / unknown course id | The requested course does not exist. | `404` `COURSE_NOT_FOUND` |
 | Course not active (pending, paused, or archived) | This course is not currently open for enrollment. | `409` `COURSE_NOT_ACTIVE` |

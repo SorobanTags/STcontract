@@ -25,8 +25,13 @@ PUB_FN_RE = re.compile(r"^    pub fn ([a-z_][a-z0-9_]*)\(")
 
 
 def public_functions(source):
-    """Return {name: arg_count} for each `pub fn` in the contract impl block."""
+    """Return ({name: arg_count}, parse_errors) for each `pub fn` in the impl block.
+
+    `parse_errors` is a list of (name, line, message) for headers whose
+    parameter list cannot be delimited.
+    """
     functions = {}
+    parse_errors = []
     lines = source.splitlines()
     index = 0
     while index < len(lines):
@@ -44,13 +49,22 @@ def public_functions(source):
                 break
             cursor += 1
         signature = " ".join(header)
-        params = signature[signature.index("(") + 1 : signature.rindex(")")]
+        open_paren = signature.index("(")
+        close = signature.rfind(")")
+        if close == -1 or close < open_paren:
+            parse_errors.append(
+                (name, index + 1, f"`{name}` at lib.rs:{index + 1} has no closing `)` "
+                 f"before the `{{` line; cannot parse its signature")
+            )
+            index = cursor + 1
+            continue
+        params = signature[open_paren + 1 : close]
 
         names = [p.split(":")[0].strip() for p in split_top_level(params) if p.strip()]
         names = [n for n in names if n.lstrip("&") != "env"]
         functions[name] = len(names)
         index = cursor + 1
-    return functions
+    return functions, parse_errors
 
 
 def split_top_level(text):
@@ -60,7 +74,7 @@ def split_top_level(text):
         if char in "<([":
             depth += 1
         elif char in ">)]":
-            depth -= 1
+            depth = max(0, depth - 1)
         if char == "," and depth == 0:
             parts.append(current)
             current = ""
@@ -94,7 +108,7 @@ def mentions(readme, name):
 
 
 def main():
-    functions = public_functions(LIB_RS.read_text(encoding="utf-8"))
+    functions, parse_errors = public_functions(LIB_RS.read_text(encoding="utf-8"))
     readme = README.read_text(encoding="utf-8")
 
     errors = []
@@ -112,6 +126,8 @@ def main():
                     f"argument(s) but lib.rs takes {expected}"
                 )
 
+    for _name, _line, message in parse_errors:
+        print(f"::error file=contracts/sorobanlard/src/lib.rs::{message}")
     for message in errors:
         print(f"::error file=README.md::{message}")
     if undocumented:
@@ -121,7 +137,7 @@ def main():
 
     print(f"Checked {len(functions)} public functions: "
           f"{len(errors)} mismatch(es), {len(undocumented)} undocumented.")
-    return 1 if errors else 0
+    return 1 if errors or parse_errors else 0
 
 
 if __name__ == "__main__":
