@@ -58,6 +58,15 @@ The financial guarantees that ride on these transitions are listed in
 | `update_course`, `set_enrollment_expiry`, `set_course_expiry`, `set_prerequisite_courses`, `update_content_hash`, `set_max_certificates`, `clear_course_max_capacity`, `set_enrollment_start_ledger` | None. These panic on `Archived` (via the `Course` key lookup or an explicit check). |
 | `pause_platform` | None. It blocks enrollment platform-wide through `PlatformPaused` without touching any course's status. |
 
+### Per-course fee override: zero means "inherit"
+
+`register_course` accepts an optional per-course fee override. A **zero**
+override is not an explicit "free" setting: it means *no override*, and the
+course inherits the global default fee (`DataKey::PlatformFee`). To make a
+course free, the global default must be zero or the course must be priced at
+zero; a zero override alone does not waive the fee. The same rule applies to
+`update_course` when it changes the override.
+
 ### Rejected and Archived are terminal
 
 - **Rejected** has no outgoing transition. The record stays under
@@ -151,6 +160,34 @@ Certificate:  valid ── revoke_certificate / bulk_revoke ──▶ pending re
                                                              permanently revoked (terminal)
 ```
 
+### Certificate expiry boundary
+
+`verify_certificate` treats `expires_at_ledger` as an **exclusive** upper
+bound: a certificate is valid while `ledger < expires_at_ledger` and expired
+once `ledger >= expires_at_ledger`. Expiry is derived on read; nothing is
+written to the `Certificate` record. Expiry and revocation are independent:
+a certificate is reported valid only if it is neither expired nor revoked.
+
+| Ledger | `verify_certificate` result |
+|--------|-----------------------------|
+| `expires_at_ledger - 1` | valid (assuming not revoked) |
+| `expires_at_ledger` | expired |
+| `expires_at_ledger + 1` | expired |
+
+### Certificate revocation challenge-period boundary
+
+`revoke_certificate` / `bulk_revoke_course_certificates` move a certificate to
+*pending revocation* and set `revocation_deadline`. The boundary is exclusive
+on the challenge side: `challenge_revocation` succeeds only while
+`ledger < revocation_deadline`. At and after the deadline the revocation is
+permanent and `challenge_revocation` panics.
+
+| Ledger | `challenge_revocation` | Certificate state |
+|--------|------------------------|-------------------|
+| `revocation_deadline - 1` | succeeds | back to valid |
+| `revocation_deadline` | panics | permanently revoked |
+| `revocation_deadline + 1` | panics | permanently revoked |
+
 ---
 
 ## Notes and known gaps
@@ -189,3 +226,17 @@ rather than changed. Each is a candidate follow-up issue.
    course that must be `Paused`. `validate_enrollment` then panics with
    `"course is not available for enrollment"`, which reverts the whole
    archive call.
+
+### Archived lookup and storage expiry
+
+- During the `ARCHIVE_COOLDOWN_LEDGERS` window, up to and including the
+  boundary ledger, `get_course` returns the `Archived` record from
+  `DataKey::ArchivedCourse(id)`. It never recreates `DataKey::Course(id)`.
+- `archive_course` extends the archived entry's TTL to
+  `PERSISTENT_TTL_EXTEND_TO`, and each `get_course` call extends it again. If
+  nothing reads the key before that TTL runs out, the network archives the
+  entry. After that, `get_course` cannot read it: the transaction fails and
+  does not return `None`. The entry has to be restored (`RestoreFootprintOp`)
+  before it can be looked up again.
+- Coverage: `contracts/sorobanlard/src/test/course_status.rs`. Run it with
+  `cargo test -p sorobanlard course_status`.
