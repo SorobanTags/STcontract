@@ -22,5 +22,11 @@ under `fuzz/artifacts/register_course/` and can be replayed with
 - `register_course` feeds arbitrary bytes to `register_course` as the course ID
   and checks that the contract accepts exactly the IDs that are non-empty,
   at most 256 bytes, and printable ASCII. Any other outcome fails the run.
+- `withdraw_earnings` enrolls a student, then fuzzes `withdraw_earnings` with an
+  arbitrary amount derived from the input. It asserts that the call succeeds
+  iff `1 <= amount <= credited_balance` and that the instructor's token balance
+  increases by exactly the withdrawn amount, covering INV-06
+  (`withdrawal_pays_exactly_credited_balance`). Run it with
+  `cargo +nightly fuzz run withdraw_earnings`.
 
 Fuzzing is slow, so run it periodically rather than in CI.

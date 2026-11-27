@@ -1810,6 +1810,135 @@ fn test_archive_course_rejects_oversized_refund_list() {
     client.archive_course(&admin, &sec_admin, &course_id, &Some(too_many));
 }
 
+// ============================================================
+// CERTIFICATE VERIFICATION AFTER COURSE ARCHIVAL (#89)
+// ============================================================
+
+#[test]
+fn test_certificate_still_valid_after_course_archival() {
+    let (env, contract_id, token_id, admin, sec_admin, _treasury, instructor) = setup();
+    let client = SorobanLardContractClient::new(&env, &contract_id);
+
+    register_and_approve_course(
+        &env,
+        &client,
+        &token_id,
+        &admin,
+        &instructor,
+        "COURSE-ARCHIVE-CERT",
+        100_000_000,
+    );
+    let course_id = String::from_str(&env, "COURSE-ARCHIVE-CERT");
+    let cert_id = String::from_str(&env, "CERT-ARCHIVE-1");
+    let student = Address::generate(&env);
+
+    enroll_and_certify(
+        &env,
+        &client,
+        &token_id,
+        &admin,
+        &student,
+        "COURSE-ARCHIVE-CERT",
+        "CERT-ARCHIVE-1",
+    );
+
+    // Certificate is valid before archival.
+    assert!(client.verify_certificate(&cert_id));
+    assert_eq!(client.get_course_certificates(&course_id).len(), 1);
+
+    // mark_completed already decremented active_enrollments to 0, so the
+    // course can be archived without any student refunds.
+    client.pause_course(&admin, &course_id);
+    env.mock_all_auths_allowing_non_root_auth();
+    client.archive_course(&admin, &sec_admin, &course_id, &None);
+
+    // The course is now archived but still retrievable.
+    let course = client.get_course(&course_id).unwrap();
+    assert_eq!(course.status, CourseStatus::Archived);
+
+    // Archival must not erase or revoke an otherwise valid credential.
+    assert!(
+        client.verify_certificate(&cert_id),
+        "certificate should remain valid after course archival"
+    );
+
+    // The full certificate record is still retrievable and unrevoked.
+    let cert = client.get_certificate(&admin, &cert_id);
+    assert!(!cert.revoked);
+    assert_eq!(cert.course_id, course_id);
+    assert_eq!(cert.student, student);
+    assert_eq!(cert.revocation_reason, None);
+
+    // The certificate index is preserved — archival does not prune it.
+    assert_eq!(client.get_course_certificates(&course_id).len(), 1);
+    assert_eq!(
+        client.get_course_certificates(&course_id).get(0).unwrap(),
+        cert_id
+    );
+}
+
+#[test]
+fn test_multiple_certificates_survive_archival_independently() {
+    let (env, contract_id, token_id, admin, sec_admin, _treasury, instructor) = setup();
+    let client = SorobanLardContractClient::new(&env, &contract_id);
+
+    register_and_approve_course(
+        &env,
+        &client,
+        &token_id,
+        &admin,
+        &instructor,
+        "COURSE-ARCHIVE-MULTI",
+        100_000_000,
+    );
+    let course_id = String::from_str(&env, "COURSE-ARCHIVE-MULTI");
+    let cert_names = [
+        "CERT-ARCH-MULTI-0",
+        "CERT-ARCH-MULTI-1",
+        "CERT-ARCH-MULTI-2",
+    ];
+
+    for cert_name in cert_names {
+        let student = Address::generate(&env);
+        enroll_and_certify(
+            &env,
+            &client,
+            &token_id,
+            &admin,
+            &student,
+            "COURSE-ARCHIVE-MULTI",
+            cert_name,
+        );
+    }
+
+    assert_eq!(client.get_course_certificates(&course_id).len(), 3);
+
+    // All three students completed, so active_enrollments is 0.
+    client.pause_course(&admin, &course_id);
+    env.mock_all_auths_allowing_non_root_auth();
+    client.archive_course(&admin, &sec_admin, &course_id, &None);
+
+    assert_eq!(
+        client.get_course(&course_id).unwrap().status,
+        CourseStatus::Archived
+    );
+
+    // Every certificate is independently verifiable after archival.
+    for cert_name in cert_names {
+        let cert_id = String::from_str(&env, cert_name);
+        assert!(
+            client.verify_certificate(&cert_id),
+            "{} should be valid after archival",
+            cert_name
+        );
+        let cert = client.get_certificate(&admin, &cert_id);
+        assert!(!cert.revoked);
+    }
+
+    // The index is intact and still lists every issued certificate.
+    assert_eq!(client.get_course_certificates(&course_id).len(), 3);
+}
+
 #[test]
 #[should_panic]
 fn test_enroll_insufficient_funds_rollback() {
@@ -3127,6 +3256,34 @@ fn test_zero_balance_withdrawal_is_safe() {
 
     assert_eq!(client.get_instructor_earnings(&instructor, &token_id), 0);
     client.withdraw_earnings(&instructor, &token_id, &0);
+    assert_eq!(client.get_instructor_earnings(&instructor, &token_id), 0);
+}
+
+#[test]
+fn test_withdraw_earnings_zero_balance_panics_and_preserves_balance() {
+    let (env, contract_id, token_id, _admin, _sec_admin, _treasury, instructor) = setup();
+    let client = SorobanLardContractClient::new(&env, &contract_id);
+    let token_client = token::Client::new(&env, &token_id);
+
+    let balance_before = token_client.balance(&instructor);
+    assert_eq!(client.get_instructor_earnings(&instructor, &token_id), 0);
+
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        client.withdraw_earnings(&instructor, &token_id, &100);
+    }));
+    let err = result.expect_err("withdraw_earnings should panic when credited balance is zero");
+    let msg = if let Some(s) = err.downcast_ref::<&str>() {
+        std::string::String::from(*s)
+    } else if let Some(s) = err.downcast_ref::<std::string::String>() {
+        s.clone()
+    } else {
+        std::string::String::new()
+    };
+    assert!(
+        msg.contains("insufficient earnings balance"),
+        "unexpected panic message: {msg}"
+    );
+    assert_eq!(token_client.balance(&instructor), balance_before);
     assert_eq!(client.get_instructor_earnings(&instructor, &token_id), 0);
 }
 
@@ -4518,6 +4675,51 @@ fn test_re_enroll_after_completion_succeeds() {
     // Course stats reflect a second enrollment
     let course = client.get_course(&course_id).unwrap();
     assert_eq!(course.total_enrollments, 2);
+}
+
+#[test]
+fn test_re_enroll_history_preserves_original_payment_split() {
+    let (env, contract_id, token_id, admin, _sec_admin, treasury, instructor) = setup();
+    let client = SorobanLardContractClient::new(&env, &contract_id);
+    let token_client = token::Client::new(&env, &token_id);
+
+    let student = Address::generate(&env);
+    token::StellarAssetClient::new(&env, &token_id).mint(&student, &10_000_000_000);
+
+    let price: i128 = 500_000_000;
+    register_and_approve_course(
+        &env,
+        &client,
+        &token_id,
+        &admin,
+        &instructor,
+        "COURSE-REENROLL-PAYMENT-HISTORY",
+        price,
+    );
+    let course_id = String::from_str(&env, "COURSE-REENROLL-PAYMENT-HISTORY");
+
+    let treasury_before = token_client.balance(&treasury);
+    let contract_before = token_client.balance(&contract_id);
+    let earnings_before = client.get_instructor_earnings(&instructor, &token_id);
+
+    client.enroll(&student, &course_id);
+
+    let treasury_after_first = token_client.balance(&treasury);
+    let contract_after_first = token_client.balance(&contract_id);
+    let earnings_after_first = client.get_instructor_earnings(&instructor, &token_id);
+    let platform_transferred = treasury_after_first - treasury_before;
+    let instructor_credited = earnings_after_first - earnings_before;
+    assert_eq!(contract_after_first - contract_before, instructor_credited);
+
+    client.mark_completed(&admin, &student, &course_id, &None);
+    client.re_enroll(&student, &course_id);
+
+    let history = client.get_enrollment_history(&student, &student, &course_id);
+    assert_eq!(history.len(), 1);
+    let archived = history.get(0).unwrap();
+    assert_eq!(archived.platform_amount, platform_transferred);
+    assert_eq!(archived.instructor_amount, instructor_credited);
+    assert_eq!(archived.platform_amount + archived.instructor_amount, price);
 }
 
 #[test]
@@ -8581,6 +8783,491 @@ fn test_issue_146_rerevocation_after_successful_challenge() {
     );
 }
 
+// ============================================================
+// ISSUE #75 TESTS — Zero Per-Course Fee Override Semantics
+// ============================================================
+//
+// A per-course `platform_fee_percent` of `0` is NOT an explicit "free"
+// override: it means "inherit the platform default fee". To charge a
+// non-default fee, the instructor must pass a non-zero override.
+
+#[test]
+fn test_issue_75_zero_fee_override_inherits_global_default() {
+    let (env, contract_id, token_id, admin, _sec_admin, treasury, instructor) = setup();
+    let client = SorobanLardContractClient::new(&env, &contract_id);
+    let token_client = token::Client::new(&env, &token_id);
+
+    let student = Address::generate(&env);
+    token::StellarAssetClient::new(&env, &token_id).mint(&student, &100_000_000_000);
+
+    let price: i128 = 1_000_000_000;
+    register_and_approve_course(
+        &env,
+        &client,
+        &token_id,
+        &admin,
+        &instructor,
+        "COURSE-ZERO-FEE",
+        price,
+    );
+
+    // The stored course fee is the platform default, not zero.
+    let course = client
+        .get_course(&String::from_str(&env, "COURSE-ZERO-FEE"))
+        .unwrap();
+    assert_eq!(course.platform_fee_percent, 20);
+
+    client.enroll(&student, &String::from_str(&env, "COURSE-ZERO-FEE"));
+
+    // Enrollment charges the default 20% split.
+    let platform_share = price * 20 / 100;
+    assert_eq!(token_client.balance(&treasury), platform_share);
+    assert_eq!(
+        client.get_instructor_earnings(&instructor, &token_id),
+        price - platform_share
+    );
+}
+
+#[test]
+fn test_issue_75_zero_fee_override_tracks_default_changes() {
+    let (env, contract_id, token_id, admin, _sec_admin, treasury, instructor) = setup();
+    let client = SorobanLardContractClient::new(&env, &contract_id);
+    let token_client = token::Client::new(&env, &token_id);
+
+    let student = Address::generate(&env);
+    token::StellarAssetClient::new(&env, &token_id).mint(&student, &100_000_000_000);
+
+    let price: i128 = 1_000_000_000;
+    register_and_approve_course(
+        &env,
+        &client,
+        &token_id,
+        &admin,
+        &instructor,
+        "COURSE-ZERO-FEE-DYN",
+        price,
+    );
+
+    // Change the platform default after registration.
+    client.update_default_fee(&admin, &35u32);
+
+    client.enroll(&student, &String::from_str(&env, "COURSE-ZERO-FEE-DYN"));
+
+    // The zero override inherits the *current* default (35%), not the old 20%.
+    let platform_share = price * 35 / 100;
+    assert_eq!(token_client.balance(&treasury), platform_share);
+    assert_eq!(
+        client.get_instructor_earnings(&instructor, &token_id),
+        price - platform_share
+    );
+}
+
+#[test]
+fn test_issue_75_nonzero_fee_override_ignores_default_changes() {
+    let (env, contract_id, token_id, admin, _sec_admin, treasury, instructor) = setup();
+    let client = SorobanLardContractClient::new(&env, &contract_id);
+    let token_client = token::Client::new(&env, &token_id);
+
+    let student = Address::generate(&env);
+    token::StellarAssetClient::new(&env, &token_id).mint(&student, &100_000_000_000);
+
+    let price: i128 = 1_000_000_000;
+    client.register_course(
+        &instructor,
+        &String::from_str(&env, "COURSE-EXPLICIT-FEE"),
+        &price,
+        &token_id,
+        &10u32, // explicit 10% override
+        &None,
+        &BytesN::from_array(&env, &[1u8; 32]),
+        &soroban_sdk::Vec::new(&env),
+    );
+    env.ledger().with_mut(|l| {
+        l.sequence_number += 1;
+    });
+    client.approve_course(&admin, &String::from_str(&env, "COURSE-EXPLICIT-FEE"));
+
+    // Changing the default must not affect an explicit override.
+    client.update_default_fee(&admin, &35u32);
+
+    client.enroll(&student, &String::from_str(&env, "COURSE-EXPLICIT-FEE"));
+
+    let platform_share = price * 10 / 100;
+    assert_eq!(token_client.balance(&treasury), platform_share);
+    assert_eq!(
+        client.get_instructor_earnings(&instructor, &token_id),
+        price - platform_share
+    );
+}
+
+// ============================================================
+// ISSUE #82 TESTS — Certificate Expiration Ledger Boundary
+// ============================================================
+//
+// `verify_certificate` returns true while `ledger < expires_at_ledger`
+// and false at or after `expires_at_ledger`.
+
+#[test]
+fn test_issue_82_certificate_expiration_ledger_boundary() {
+    let (env, contract_id, token_id, admin, _sec_admin, _treasury, instructor) = setup();
+    let client = SorobanLardContractClient::new(&env, &contract_id);
+
+    let student = Address::generate(&env);
+    token::StellarAssetClient::new(&env, &token_id).mint(&student, &100_000_000_000);
+
+    register_and_approve_course(
+        &env,
+        &client,
+        &token_id,
+        &admin,
+        &instructor,
+        "COURSE-EXPIRY",
+        500_000_000,
+    );
+
+    let course_id = String::from_str(&env, "COURSE-EXPIRY");
+    let cert_id = String::from_str(&env, "CERT-EXPIRY");
+
+    client.enroll(&student, &course_id);
+    client.mark_completed(&admin, &student, &course_id, &None);
+
+    let expires_at = env.ledger().sequence() + 100;
+    client.issue_certificate(
+        &admin,
+        &student,
+        &course_id,
+        &cert_id,
+        &String::from_str(&env, "Course"),
+        &get_enrollment_ref(&env, &client, &student, "COURSE-EXPIRY"),
+        &Some(expires_at),
+        &None,
+    );
+
+    // Immediately after issuance the certificate is valid.
+    assert!(client.verify_certificate(&cert_id));
+
+    // One ledger before expiry: still valid.
+    env.ledger().with_mut(|l| {
+        l.sequence_number = expires_at - 1;
+    });
+    assert!(client.verify_certificate(&cert_id));
+
+    // Exactly at expiry: no longer valid.
+    env.ledger().with_mut(|l| {
+        l.sequence_number = expires_at;
+    });
+    assert!(!client.verify_certificate(&cert_id));
+
+    // One ledger after expiry: still invalid.
+    env.ledger().with_mut(|l| {
+        l.sequence_number = expires_at + 1;
+    });
+    assert!(!client.verify_certificate(&cert_id));
+}
+
+// ============================================================
+// ISSUE #83 TESTS — Instructor Signature Mismatch on Issuance
+// ============================================================
+
+/// Count `certificate_issued` events emitted by the contract.
+fn count_certificate_issued_events(env: &Env, contract_id: &Address) -> u32 {
+    let mut count = 0u32;
+    for (contract, topics, _data) in env.events().all().iter() {
+        if contract != *contract_id {
+            continue;
+        }
+        if let Some(topic0) = topics.get(0) {
+            if let Ok(sym) = Symbol::try_from_val(env, &topic0) {
+                if sym == Symbol::new(env, "certificate_issued") {
+                    count += 1;
+                }
+            }
+        }
+    }
+    count
+}
+
+#[test]
+fn test_issue_83_missing_instructor_signature_rejected() {
+    let (env, contract_id, token_id, admin, _sec_admin, _treasury, instructor) = setup();
+    let client = SorobanLardContractClient::new(&env, &contract_id);
+
+    let student = Address::generate(&env);
+    token::StellarAssetClient::new(&env, &token_id).mint(&student, &100_000_000_000);
+
+    register_and_approve_course(
+        &env,
+        &client,
+        &token_id,
+        &admin,
+        &instructor,
+        "COURSE-SIG-MISSING",
+        500_000_000,
+    );
+
+    let course_id = String::from_str(&env, "COURSE-SIG-MISSING");
+    let cert_id = String::from_str(&env, "CERT-SIG-MISSING");
+
+    client.enroll(&student, &course_id);
+    client.mark_completed(&admin, &student, &course_id, &None);
+
+    let events_before = count_certificate_issued_events(&env, &contract_id);
+
+    // Authorized admin, but the instructor signature is missing.
+    let res = client.try_issue_certificate(
+        &admin,
+        &student,
+        &course_id,
+        &cert_id,
+        &String::from_str(&env, "Course"),
+        &get_enrollment_ref(&env, &client, &student, "COURSE-SIG-MISSING"),
+        &None,
+        &None,
+    );
+    assert!(
+        res.is_err(),
+        "issuance must reject a missing instructor signature"
+    );
+
+    // No certificate record was written.
+    assert!(client.get_certificate(&admin, &cert_id).is_none());
+
+    // No certificate_issued event was emitted.
+    assert_eq!(
+        count_certificate_issued_events(&env, &contract_id),
+        events_before,
+        "no certificate_issued event may be emitted on rejection"
+    );
+}
+
+#[test]
+fn test_issue_83_mismatched_instructor_signature_rejected() {
+    let (env, contract_id, token_id, admin, _sec_admin, _treasury, instructor) = setup();
+    let client = SorobanLardContractClient::new(&env, &contract_id);
+
+    let student = Address::generate(&env);
+    token::StellarAssetClient::new(&env, &token_id).mint(&student, &100_000_000_000);
+
+    register_and_approve_course(
+        &env,
+        &client,
+        &token_id,
+        &admin,
+        &instructor,
+        "COURSE-SIG-MISMATCH",
+        500_000_000,
+    );
+
+    let course_id = String::from_str(&env, "COURSE-SIG-MISMATCH");
+    let cert_id = String::from_str(&env, "CERT-SIG-MISMATCH");
+
+    client.enroll(&student, &course_id);
+    client.mark_completed(&admin, &student, &course_id, &None);
+
+    let events_before = count_certificate_issued_events(&env, &contract_id);
+
+    // Authorized admin, but the supplied instructor signature is a
+    // different address than the course instructor.
+    let wrong_instructor = Address::generate(&env);
+    let res = client.try_issue_certificate(
+        &admin,
+        &student,
+        &course_id,
+        &cert_id,
+        &String::from_str(&env, "Course"),
+        &get_enrollment_ref(&env, &client, &student, "COURSE-SIG-MISMATCH"),
+        &None,
+        &Some(wrong_instructor),
+    );
+    assert!(
+        res.is_err(),
+        "issuance must reject a mismatched instructor signature"
+    );
+
+    // No certificate record was written.
+    assert!(client.get_certificate(&admin, &cert_id).is_none());
+
+    // No certificate_issued event was emitted.
+    assert_eq!(
+        count_certificate_issued_events(&env, &contract_id),
+        events_before,
+        "no certificate_issued event may be emitted on rejection"
+    );
+}
+
+// ============================================================
+// ISSUE #84 TESTS — Revocation Challenge-Period Boundaries
+// ============================================================
+//
+// `challenge_revocation` succeeds only while `ledger < revocation_deadline`.
+// At or after the deadline the revocation is permanent and
+// `verify_certificate` returns false.
+
+#[test]
+fn test_issue_84_challenge_period_boundaries() {
+    let (env, contract_id, token_id, admin, _sec_admin, _treasury, instructor) = setup();
+    let client = SorobanLardContractClient::new(&env, &contract_id);
+
+    let student = Address::generate(&env);
+    token::StellarAssetClient::new(&env, &token_id).mint(&student, &100_000_000_000);
+
+    register_and_approve_course(
+        &env,
+        &client,
+        &token_id,
+        &admin,
+        &instructor,
+        "COURSE-CHAL-BOUND",
+        500_000_000,
+    );
+
+    let course_id = String::from_str(&env, "COURSE-CHAL-BOUND");
+    let cert_id = String::from_str(&env, "CERT-CHAL-BOUND");
+
+    client.enroll(&student, &course_id);
+    client.mark_completed(&admin, &student, &course_id, &None);
+    client.issue_certificate(
+        &admin,
+        &student,
+        &course_id,
+        &cert_id,
+        &String::from_str(&env, "Course"),
+        &get_enrollment_ref(&env, &client, &student, "COURSE-CHAL-BOUND"),
+        &None,
+        &None,
+    );
+
+    client.revoke_certificate(&admin, &cert_id, &String::from_str(&env, "TEST"));
+    let deadline = client
+        .get_certificate(&admin, &cert_id)
+        .revocation_deadline
+        .unwrap();
+
+    // Before the deadline the certificate still verifies.
+    env.ledger().with_mut(|l| {
+        l.sequence_number = deadline - 1;
+    });
+    assert!(client.verify_certificate(&cert_id));
+
+    // At the deadline the revocation is permanent.
+    env.ledger().with_mut(|l| {
+        l.sequence_number = deadline;
+    });
+    assert!(!client.verify_certificate(&cert_id));
+
+    // After the deadline it remains permanent.
+    env.ledger().with_mut(|l| {
+        l.sequence_number = deadline + 1;
+    });
+    assert!(!client.verify_certificate(&cert_id));
+}
+
+#[test]
+fn test_issue_84_challenge_succeeds_before_deadline() {
+    let (env, contract_id, token_id, admin, _sec_admin, _treasury, instructor) = setup();
+    let client = SorobanLardContractClient::new(&env, &contract_id);
+
+    let student = Address::generate(&env);
+    token::StellarAssetClient::new(&env, &token_id).mint(&student, &100_000_000_000);
+
+    register_and_approve_course(
+        &env,
+        &client,
+        &token_id,
+        &admin,
+        &instructor,
+        "COURSE-CHAL-OK-BOUND",
+        500_000_000,
+    );
+
+    let course_id = String::from_str(&env, "COURSE-CHAL-OK-BOUND");
+    let cert_id = String::from_str(&env, "CERT-CHAL-OK-BOUND");
+
+    client.enroll(&student, &course_id);
+    client.mark_completed(&admin, &student, &course_id, &None);
+    client.issue_certificate(
+        &admin,
+        &student,
+        &course_id,
+        &cert_id,
+        &String::from_str(&env, "Course"),
+        &get_enrollment_ref(&env, &client, &student, "COURSE-CHAL-OK-BOUND"),
+        &None,
+        &None,
+    );
+
+    client.revoke_certificate(&admin, &cert_id, &String::from_str(&env, "TEST"));
+    let deadline = client
+        .get_certificate(&admin, &cert_id)
+        .revocation_deadline
+        .unwrap();
+
+    env.ledger().with_mut(|l| {
+        l.sequence_number = deadline - 1;
+    });
+    client.challenge_revocation(&student, &cert_id);
+
+    let cert = client.get_certificate(&admin, &cert_id);
+    assert!(!cert.revoked);
+    assert!(cert.revocation_deadline.is_none());
+    assert!(client.verify_certificate(&cert_id));
+}
+
+#[test]
+fn test_issue_84_challenge_rejected_at_and_after_deadline() {
+    let (env, contract_id, token_id, admin, _sec_admin, _treasury, instructor) = setup();
+    let client = SorobanLardContractClient::new(&env, &contract_id);
+
+    let student = Address::generate(&env);
+    token::StellarAssetClient::new(&env, &token_id).mint(&student, &100_000_000_000);
+
+    register_and_approve_course(
+        &env,
+        &client,
+        &token_id,
+        &admin,
+        &instructor,
+        "COURSE-CHAL-LATE-BOUND",
+        500_000_000,
+    );
+
+    let course_id = String::from_str(&env, "COURSE-CHAL-LATE-BOUND");
+    let cert_id = String::from_str(&env, "CERT-CHAL-LATE-BOUND");
+
+    client.enroll(&student, &course_id);
+    client.mark_completed(&admin, &student, &course_id, &None);
+    client.issue_certificate(
+        &admin,
+        &student,
+        &course_id,
+        &cert_id,
+        &String::from_str(&env, "Course"),
+        &get_enrollment_ref(&env, &client, &student, "COURSE-CHAL-LATE-BOUND"),
+        &None,
+        &None,
+    );
+
+    client.revoke_certificate(&admin, &cert_id, &String::from_str(&env, "TEST"));
+    let deadline = client
+        .get_certificate(&admin, &cert_id)
+        .revocation_deadline
+        .unwrap();
+
+    // At the deadline: challenge must be rejected.
+    env.ledger().with_mut(|l| {
+        l.sequence_number = deadline;
+    });
+    assert!(client.try_challenge_revocation(&student, &cert_id).is_err());
+    assert!(!client.verify_certificate(&cert_id));
+
+    // After the deadline: challenge must still be rejected.
+    env.ledger().with_mut(|l| {
+        l.sequence_number = deadline + 1;
+    });
+    assert!(client.try_challenge_revocation(&student, &cert_id).is_err());
+    assert!(!client.verify_certificate(&cert_id));
+}
+
 #[test]
 fn test_issue_146_configurable_challenge_period() {
     let (env, contract_id, token_id, admin, _sec_admin, _treasury, instructor) = setup();
@@ -10210,6 +10897,232 @@ fn test_bulk_revoke_emits_course_certificates_revoked_event() {
     assert_eq!(event_ledger, env.ledger().sequence());
 }
 
+// ============================================================
+// PAGINATED BULK REVOCATION (#87)
+// ============================================================
+
+#[test]
+fn test_paginated_bulk_revoke_progresses_through_pages() {
+    let (env, contract_id, token_id, admin, _sec_admin, _treasury, instructor) = setup();
+    let client = SorobanLardContractClient::new(&env, &contract_id);
+
+    register_and_approve_course(
+        &env,
+        &client,
+        &token_id,
+        &admin,
+        &instructor,
+        "COURSE-PAG-PROGRESS",
+        100_000_000,
+    );
+    let course_id = String::from_str(&env, "COURSE-PAG-PROGRESS");
+    let cert_names = [
+        "CERT-PAG-0",
+        "CERT-PAG-1",
+        "CERT-PAG-2",
+        "CERT-PAG-3",
+        "CERT-PAG-4",
+    ];
+    for cert_name in cert_names {
+        let student = Address::generate(&env);
+        enroll_and_certify(
+            &env,
+            &client,
+            &token_id,
+            &admin,
+            &student,
+            "COURSE-PAG-PROGRESS",
+            cert_name,
+        );
+    }
+    assert_eq!(client.get_course_certificates(&course_id).len(), 5);
+
+    // Page 1: cursor=0, limit=2 → revoke 2, advance to cursor=2
+    let page = client.bulk_revoke_certificates_paged(&admin, &course_id, &0u32, &2u32);
+    assert_eq!(page.revoked_count, 2);
+    assert_eq!(page.processed, 2);
+    assert_eq!(page.next_cursor, Some(2));
+
+    // Page 2: cursor=2, limit=2 → revoke 2, advance to cursor=4
+    let page = client.bulk_revoke_certificates_paged(&admin, &course_id, &2u32, &2u32);
+    assert_eq!(page.revoked_count, 2);
+    assert_eq!(page.processed, 2);
+    assert_eq!(page.next_cursor, Some(4));
+
+    // Page 3: cursor=4, limit=2 → revoke 1 (only one left), done
+    let page = client.bulk_revoke_certificates_paged(&admin, &course_id, &4u32, &2u32);
+    assert_eq!(page.revoked_count, 1);
+    assert_eq!(page.processed, 1);
+    assert_eq!(page.next_cursor, None);
+
+    // Every certificate is revoked — no skips.
+    for cert_name in cert_names {
+        let cert = client.get_certificate(&admin, &String::from_str(&env, cert_name));
+        assert!(cert.revoked, "{} should be revoked", cert_name);
+    }
+}
+
+#[test]
+fn test_paginated_bulk_revoke_resume_is_idempotent() {
+    let (env, contract_id, token_id, admin, _sec_admin, _treasury, instructor) = setup();
+    let client = SorobanLardContractClient::new(&env, &contract_id);
+
+    register_and_approve_course(
+        &env,
+        &client,
+        &token_id,
+        &admin,
+        &instructor,
+        "COURSE-PAG-RESUME",
+        100_000_000,
+    );
+    let course_id = String::from_str(&env, "COURSE-PAG-RESUME");
+    let cert_names = ["CERT-RES-0", "CERT-RES-1", "CERT-RES-2", "CERT-RES-3"];
+    for cert_name in cert_names {
+        let student = Address::generate(&env);
+        enroll_and_certify(
+            &env,
+            &client,
+            &token_id,
+            &admin,
+            &student,
+            "COURSE-PAG-RESUME",
+            cert_name,
+        );
+    }
+
+    // Page 1 succeeds: revokes 2, advances cursor to 2.
+    let page = client.bulk_revoke_certificates_paged(&admin, &course_id, &0u32, &2u32);
+    assert_eq!(page.revoked_count, 2);
+    assert_eq!(page.next_cursor, Some(2));
+
+    // Simulate a retry of page 1 (the caller's cursor did not advance
+    // because the previous call "failed"). The already-revoked
+    // certificates are skipped — no double count.
+    let page = client.bulk_revoke_certificates_paged(&admin, &course_id, &0u32, &2u32);
+    assert_eq!(page.revoked_count, 0);
+    assert_eq!(page.processed, 2);
+    assert_eq!(page.next_cursor, Some(2));
+
+    // Resume from cursor=2: the remaining live certificates are processed.
+    let page = client.bulk_revoke_certificates_paged(&admin, &course_id, &2u32, &2u32);
+    assert_eq!(page.revoked_count, 2);
+    assert_eq!(page.processed, 2);
+    assert_eq!(page.next_cursor, None);
+
+    for cert_name in cert_names {
+        let cert = client.get_certificate(&admin, &String::from_str(&env, cert_name));
+        assert!(cert.revoked, "{} should be revoked", cert_name);
+    }
+}
+
+#[test]
+fn test_paginated_bulk_revoke_cursor_past_end_is_noop() {
+    let (env, contract_id, token_id, admin, _sec_admin, _treasury, instructor) = setup();
+    let client = SorobanLardContractClient::new(&env, &contract_id);
+
+    register_and_approve_course(
+        &env,
+        &client,
+        &token_id,
+        &admin,
+        &instructor,
+        "COURSE-PAG-NOOP",
+        100_000_000,
+    );
+    let course_id = String::from_str(&env, "COURSE-PAG-NOOP");
+    let student = Address::generate(&env);
+    enroll_and_certify(
+        &env,
+        &client,
+        &token_id,
+        &admin,
+        &student,
+        "COURSE-PAG-NOOP",
+        "CERT-NOOP-0",
+    );
+
+    // Cursor beyond the index is an empty page with next_cursor=None.
+    let page = client.bulk_revoke_certificates_paged(&admin, &course_id, &10u32, &5u32);
+    assert_eq!(page.revoked_count, 0);
+    assert_eq!(page.processed, 0);
+    assert_eq!(page.next_cursor, None);
+
+    // The live certificate is untouched.
+    assert!(client.verify_certificate(&String::from_str(&env, "CERT-NOOP-0")));
+}
+
+#[test]
+fn test_paginated_bulk_revoke_clamps_limit() {
+    let (env, contract_id, token_id, admin, _sec_admin, _treasury, instructor) = setup();
+    let client = SorobanLardContractClient::new(&env, &contract_id);
+
+    register_and_approve_course(
+        &env,
+        &client,
+        &token_id,
+        &admin,
+        &instructor,
+        "COURSE-PAG-CLAMP",
+        100_000_000,
+    );
+    let course_id = String::from_str(&env, "COURSE-PAG-CLAMP");
+
+    // Issue more than MAX_PAGE_SIZE certificates via direct storage so the
+    // test does not pay the full enroll/complete/issue cost 55 times.
+    let total = SorobanLardContract::MAX_PAGE_SIZE + 5;
+    env.as_contract(&contract_id, || {
+        let mut certificate_ids = soroban_sdk::Vec::new(&env);
+        for index in 0..total {
+            let certificate_id = String::from_str(&env, &format!("CERT-CLAMP-{index}"));
+            let certificate = Certificate {
+                id: certificate_id.clone(),
+                student: Address::generate(&env),
+                course_id: course_id.clone(),
+                course_title: String::from_str(&env, "Paginated clamp course"),
+                enrollment_reference: String::from_str(&env, "clamp-enrollment"),
+                instructor: instructor.clone(),
+                issued_by: contract_id.clone(),
+                issued_at_ledger: env.ledger().sequence(),
+                revoked: false,
+                revoked_by: None,
+                revocation_ledger: None,
+                revocation_reason: None,
+                expires_at_ledger: None,
+                instructor_signature: None,
+                revocation_deadline: None,
+            };
+            env.storage()
+                .persistent()
+                .set(&DataKey::Certificate(certificate_id.clone()), &certificate);
+            certificate_ids.push_back(certificate_id);
+        }
+        env.storage().persistent().set(
+            &DataKey::CourseCertificates(course_id.clone()),
+            &certificate_ids,
+        );
+    });
+
+    assert_eq!(client.get_course_certificates(&course_id).len(), total);
+
+    // An oversized limit is clamped to MAX_PAGE_SIZE.
+    let page = client.bulk_revoke_certificates_paged(&admin, &course_id, &0u32, &u32::MAX);
+    assert_eq!(page.processed, SorobanLardContract::MAX_PAGE_SIZE);
+    assert_eq!(page.revoked_count, SorobanLardContract::MAX_PAGE_SIZE);
+    assert_eq!(page.next_cursor, Some(SorobanLardContract::MAX_PAGE_SIZE));
+
+    // The remainder fits in one more page.
+    let page = client.bulk_revoke_certificates_paged(
+        &admin,
+        &course_id,
+        &SorobanLardContract::MAX_PAGE_SIZE,
+        &u32::MAX,
+    );
+    assert_eq!(page.processed, 5);
+    assert_eq!(page.revoked_count, 5);
+    assert_eq!(page.next_cursor, None);
+}
+
 #[test]
 fn test_bulk_revoked_certificate_can_still_be_challenged_and_re_revoked() {
     let (env, contract_id, token_id, admin, _sec_admin, _treasury, instructor) = setup();
@@ -10321,6 +11234,90 @@ fn test_bulk_revoke_course_without_certificates_rejected() {
     client.bulk_revoke_course_certificates(&admin, &String::from_str(&env, "COURSE-BULK-EMPTY"));
 }
 
+// ============================================================
+// ISSUE #86 — bulk revocation preserves certificate records and indexes
+// ============================================================
+
+#[test]
+fn test_bulk_revoke_preserves_certificate_records_and_index() {
+    let (env, contract_id, token_id, admin, _sec_admin, _treasury, instructor) = setup();
+    let client = SorobanLardContractClient::new(&env, &contract_id);
+
+    register_and_approve_course(
+        &env,
+        &client,
+        &token_id,
+        &admin,
+        &instructor,
+        "COURSE-BULK-PRESERVE",
+        100_000_000,
+    );
+
+    let course_id = String::from_str(&env, "COURSE-BULK-PRESERVE");
+    let cert_names = [
+        "CERT-BULK-PRESERVE-0",
+        "CERT-BULK-PRESERVE-1",
+        "CERT-BULK-PRESERVE-2",
+        "CERT-BULK-PRESERVE-3",
+    ];
+
+    // Snapshot the pre-revocation records so we can prove nothing else changed.
+    let mut before = soroban_sdk::Vec::new(&env);
+    for cert_name in cert_names {
+        let student = Address::generate(&env);
+        enroll_and_certify(
+            &env,
+            &client,
+            &token_id,
+            &admin,
+            &student,
+            "COURSE-BULK-PRESERVE",
+            cert_name,
+        );
+        let cert_id = String::from_str(&env, cert_name);
+        before.push_back(client.get_certificate(&admin, &cert_id));
+    }
+
+    let index_before = client.get_course_certificates(&course_id);
+    assert_eq!(index_before.len(), cert_names.len() as u32);
+
+    let revoked_count = client.bulk_revoke_course_certificates(&admin, &course_id);
+    assert_eq!(revoked_count, cert_names.len() as u32);
+
+    // The index is unchanged: same length, same order, same IDs.
+    let index_after = client.get_course_certificates(&course_id);
+    assert_eq!(index_after.len(), index_before.len());
+    for i in 0..index_before.len() {
+        assert_eq!(index_after.get(i).unwrap(), index_before.get(i).unwrap());
+    }
+
+    // Every certificate record is still queryable and only the revocation
+    // fields changed.
+    for i in 0..cert_names.len() as u32 {
+        let cert_id = index_after.get(i).unwrap();
+        let original = before.get(i).unwrap();
+        let cert = client.get_certificate(&admin, &cert_id);
+
+        assert_eq!(cert.id, original.id);
+        assert_eq!(cert.student, original.student);
+        assert_eq!(cert.course_id, original.course_id);
+        assert_eq!(cert.course_title, original.course_title);
+        assert_eq!(cert.enrollment_reference, original.enrollment_reference);
+        assert_eq!(cert.instructor, original.instructor);
+        assert_eq!(cert.issued_by, original.issued_by);
+        assert_eq!(cert.issued_at_ledger, original.issued_at_ledger);
+
+        assert!(cert.revoked);
+        assert_eq!(cert.revoked_by, Some(admin.clone()));
+        assert_eq!(
+            cert.revocation_reason,
+            Some(String::from_str(&env, "BULK_COURSE_REVOCATION"))
+        );
+        assert!(cert.revocation_ledger.is_some());
+        assert!(cert.revocation_deadline.is_some());
+    }
+}
+
 #[test]
 fn test_get_course_certificates_empty_for_course_without_issuance() {
     let (env, contract_id, token_id, admin, _sec_admin, _treasury, instructor) = setup();
@@ -10342,6 +11339,327 @@ fn test_get_course_certificates_empty_for_course_without_issuance() {
             .len(),
         0
     );
+}
+
+// ============================================================
+// ISSUE #77 — fee split rounding for prices not divisible by 100
+// ============================================================
+//
+// Documented rule: the platform share is computed with integer truncation
+// (`price * fee_percent / 100`) and the instructor receives the remainder
+// (`price - platform_share`). The truncation remainder therefore always
+// stays with the instructor, so `platform + instructor == price` exactly.
+
+#[test]
+fn test_fee_split_rounding_prices_not_divisible_by_100() {
+    let (env, contract_id, token_id, admin, _sec_admin, treasury, instructor) = setup();
+    let client = SorobanLardContractClient::new(&env, &contract_id);
+    let token_client = token::Client::new(&env, &token_id);
+
+    // (price, fee_percent) pairs where `price * fee_percent` is not a
+    // multiple of 100, so truncation actually drops a remainder.
+    let cases: [(i128, u32); 9] = [
+        (101, 20),
+        (101, 33),
+        (199, 20),
+        (199, 50),
+        (333, 20),
+        (333, 33),
+        (333, 7),
+        (1_000_001, 20),
+        (999_999, 15),
+    ];
+
+    for (i, (price, fee_percent)) in cases.iter().enumerate() {
+        let course_id_str = format!("COURSE-ROUND-{i}");
+        let course_id = String::from_str(&env, &course_id_str);
+        let student = Address::generate(&env);
+        token::StellarAssetClient::new(&env, &token_id).mint(&student, &100_000_000_000);
+
+        client.register_course(
+            &instructor,
+            &course_id,
+            price,
+            &token_id,
+            fee_percent,
+            &None,
+            &BytesN::from_array(&env, &[1u8; 32]),
+            &soroban_sdk::Vec::new(&env),
+        );
+        env.ledger().with_mut(|l| {
+            l.sequence_number += 1;
+        });
+        client.approve_course(&admin, &course_id);
+
+        let treasury_before = token_client.balance(&treasury);
+        client.enroll(&student, &course_id);
+
+        let platform = token_client.balance(&treasury) - treasury_before;
+        let instructor_share = client.get_instructor_earnings(&instructor, &token_id);
+
+        // Platform share is the truncated product.
+        assert_eq!(
+            platform,
+            *price * *fee_percent as i128 / 100,
+            "platform share mismatch for price={price} fee={fee_percent}"
+        );
+
+        // The instructor keeps the truncation remainder.
+        assert_eq!(
+            instructor_share,
+            *price - platform,
+            "instructor share mismatch for price={price} fee={fee_percent}"
+        );
+
+        // The two shares add back to the exact amount paid.
+        assert_eq!(
+            platform + instructor_share,
+            *price,
+            "split must sum to amount paid for price={price} fee={fee_percent}"
+        );
+    }
+}
+
+#[test]
+fn test_fee_split_rounding_remainder_goes_to_instructor() {
+    let (env, contract_id, token_id, admin, _sec_admin, treasury, instructor) = setup();
+    let client = SorobanLardContractClient::new(&env, &contract_id);
+    let token_client = token::Client::new(&env, &token_id);
+
+    // 333 * 20 / 100 = 66.6 -> platform 66, instructor 267 (remainder kept).
+    let price: i128 = 333;
+    let student = Address::generate(&env);
+    token::StellarAssetClient::new(&env, &token_id).mint(&student, &100_000_000_000);
+
+    register_and_approve_course(
+        &env,
+        &client,
+        &token_id,
+        &admin,
+        &instructor,
+        "COURSE-ROUND-REMAINDER",
+        price,
+    );
+
+    let treasury_before = token_client.balance(&treasury);
+    client.enroll(&student, &String::from_str(&env, "COURSE-ROUND-REMAINDER"));
+
+    let platform = token_client.balance(&treasury) - treasury_before;
+    let instructor_share = client.get_instructor_earnings(&instructor, &token_id);
+
+    assert_eq!(platform, 66);
+    assert_eq!(instructor_share, 267);
+    assert_eq!(platform + instructor_share, price);
+    assert_eq!(token_client.balance(&student), 100_000_000_000 - price);
+}
+
+// ============================================================
+// ISSUE #78 — removing an approved token blocks new enrollment only
+// ============================================================
+
+#[test]
+fn test_remove_approved_token_blocks_new_enrollment_but_keeps_existing_obligations() {
+    let (env, contract_id, token_id, admin, _sec_admin, _treasury, instructor) = setup();
+    let client = SorobanLardContractClient::new(&env, &contract_id);
+    let token_client = token::Client::new(&env, &token_id);
+
+    register_and_approve_course(
+        &env,
+        &client,
+        &token_id,
+        &admin,
+        &instructor,
+        "COURSE-TOKEN-REMOVAL",
+        100_000_000,
+    );
+    let course_id = String::from_str(&env, "COURSE-TOKEN-REMOVAL");
+
+    // Enroll while the token is still approved.
+    let enrolled_student = Address::generate(&env);
+    token::StellarAssetClient::new(&env, &token_id).mint(&enrolled_student, &100_000_000_000);
+    client.enroll(&enrolled_student, &course_id);
+    assert_eq!(
+        client
+            .get_enrollment(&enrolled_student, &enrolled_student, &course_id)
+            .unwrap()
+            .amount_paid,
+        100_000_000
+    );
+
+    // Remove the token from the approved list.
+    client.remove_approved_token(&admin, &token_id);
+
+    // New enrollment with the removed token is blocked.
+    let new_student = Address::generate(&env);
+    token::StellarAssetClient::new(&env, &token_id).mint(&new_student, &100_000_000_000);
+    assert!(
+        client.try_enroll(&new_student, &course_id).is_err(),
+        "enrollment with a removed token must be rejected"
+    );
+
+    // Existing obligations still resolve: the enrolled student can request
+    // and receive a refund through the removed token.
+    let student_balance_before_refund = token_client.balance(&enrolled_student);
+    client.request_refund(&enrolled_student, &course_id);
+    env.mock_all_auths_allowing_non_root_auth();
+    client.process_refund(&admin, &enrolled_student, &course_id, &true);
+
+    assert!(client
+        .get_enrollment(&enrolled_student, &enrolled_student, &course_id)
+        .is_none());
+    assert_eq!(
+        token_client.balance(&enrolled_student),
+        student_balance_before_refund + 100_000_000
+    );
+    assert_eq!(client.get_instructor_earnings(&instructor, &token_id), 0);
+}
+
+#[test]
+fn test_remove_approved_token_keeps_withdraw_earnings_working() {
+    let (env, contract_id, token_id, admin, _sec_admin, _treasury, instructor) = setup();
+    let client = SorobanLardContractClient::new(&env, &contract_id);
+    let token_client = token::Client::new(&env, &token_id);
+
+    register_and_approve_course(
+        &env,
+        &client,
+        &token_id,
+        &admin,
+        &instructor,
+        "COURSE-TOKEN-WITHDRAW",
+        100_000_000,
+    );
+    let course_id = String::from_str(&env, "COURSE-TOKEN-WITHDRAW");
+
+    let student = Address::generate(&env);
+    token::StellarAssetClient::new(&env, &token_id).mint(&student, &100_000_000_000);
+    client.enroll(&student, &course_id);
+
+    let earnings = client.get_instructor_earnings(&instructor, &token_id);
+    assert!(earnings > 0);
+
+    client.remove_approved_token(&admin, &token_id);
+
+    // The instructor can still withdraw earnings accrued before removal.
+    let instructor_balance_before = token_client.balance(&instructor);
+    client.withdraw_earnings(&instructor, &token_id);
+
+    assert_eq!(
+        token_client.balance(&instructor),
+        instructor_balance_before + earnings
+    );
+    assert_eq!(client.get_instructor_earnings(&instructor, &token_id), 0);
+}
+
+// ============================================================
+// ISSUE #85 — pending certificate revocation challenge query
+// ============================================================
+
+#[test]
+fn test_get_revocation_challenge_none_when_no_challenge() {
+    let (env, contract_id, token_id, admin, _sec_admin, _treasury, instructor) = setup();
+    let client = SorobanLardContractClient::new(&env, &contract_id);
+
+    register_and_approve_course(
+        &env,
+        &client,
+        &token_id,
+        &admin,
+        &instructor,
+        "COURSE-CHALLENGE-NONE",
+        100_000_000,
+    );
+    let student = Address::generate(&env);
+    enroll_and_certify(
+        &env,
+        &client,
+        &token_id,
+        &admin,
+        &student,
+        "COURSE-CHALLENGE-NONE",
+        "CERT-CHALLENGE-NONE",
+    );
+
+    assert!(client
+        .get_revocation_challenge(&String::from_str(&env, "CERT-CHALLENGE-NONE"))
+        .is_none());
+}
+
+#[test]
+fn test_get_revocation_challenge_open_then_completed() {
+    let (env, contract_id, token_id, admin, _sec_admin, _treasury, instructor) = setup();
+    let client = SorobanLardContractClient::new(&env, &contract_id);
+
+    register_and_approve_course(
+        &env,
+        &client,
+        &token_id,
+        &admin,
+        &instructor,
+        "COURSE-CHALLENGE-OPEN",
+        100_000_000,
+    );
+    let student = Address::generate(&env);
+    enroll_and_certify(
+        &env,
+        &client,
+        &token_id,
+        &admin,
+        &student,
+        "COURSE-CHALLENGE-OPEN",
+        "CERT-CHALLENGE-OPEN",
+    );
+
+    let cert_id = String::from_str(&env, "CERT-CHALLENGE-OPEN");
+    client.revoke_certificate(
+        &admin,
+        &cert_id,
+        &String::from_str(&env, "ISSUED_IN_ERROR"),
+    );
+
+    // Open challenge: status Open with a deadline in the future.
+    let challenge = client.get_revocation_challenge(&cert_id).unwrap();
+    assert_eq!(challenge.status, RevocationChallengeStatus::Open);
+    assert!(challenge.deadline > env.ledger().sequence());
+
+    // Once the challenge period elapses the challenge is completed.
+    env.ledger().with_mut(|l| {
+        l.sequence_number = challenge.deadline;
+    });
+    let challenge = client.get_revocation_challenge(&cert_id).unwrap();
+    assert_eq!(challenge.status, RevocationChallengeStatus::Completed);
+}
+
+#[test]
+#[should_panic(expected = "unauthorized: get_revocation_challenge")]
+fn test_get_revocation_challenge_unauthorized() {
+    let (env, contract_id, token_id, admin, _sec_admin, _treasury, instructor) = setup();
+    let client = SorobanLardContractClient::new(&env, &contract_id);
+
+    register_and_approve_course(
+        &env,
+        &client,
+        &token_id,
+        &admin,
+        &instructor,
+        "COURSE-CHALLENGE-AUTH",
+        100_000_000,
+    );
+    let student = Address::generate(&env);
+    enroll_and_certify(
+        &env,
+        &client,
+        &token_id,
+        &admin,
+        &student,
+        "COURSE-CHALLENGE-AUTH",
+        "CERT-CHALLENGE-AUTH",
+    );
+
+    // An unrelated caller must not be able to read the challenge status.
+    let outsider = Address::generate(&env);
+    client.get_revocation_challenge(&String::from_str(&env, "CERT-CHALLENGE-AUTH"));
+    let _ = outsider;
 }
 
 // ============================================================
@@ -11271,6 +12589,102 @@ fn test_arbitration_cases_indexed_by_student() {
     );
 }
 
+/// INV07 — resolve_arbitration() must conserve the arbitration pool across
+/// both outcomes: the pool balance returns to zero and the recipient's token
+/// balance increases by exactly the amount recorded in the pool at escalation.
+#[test]
+fn test_invariant_inv07_arbitration_fee_custody_is_conserved() {
+    let (env, contract_id, token_id, admin, sec_admin, _treasury, instructor) = setup();
+    let client = SorobanLardContractClient::new(&env, &contract_id);
+    let token_client = token::Client::new(&env, &token_id);
+
+    let fee_per_case = 5_000_000i128;
+
+    // --- Outcome 1: resolved for the student ---
+    let student = setup_arbitration(
+        &env,
+        &client,
+        &token_id,
+        &admin,
+        &instructor,
+        "COURSE-INV07-STUDENT",
+        fee_per_case,
+    );
+    let course_id = String::from_str(&env, "COURSE-INV07-STUDENT");
+
+    client.escalate_to_arbitration(&student, &course_id);
+    let pool_at_escalation = client.get_arbitration_pool_balance(&token_id);
+    assert_eq!(
+        pool_at_escalation, fee_per_case,
+        "escalation must move exactly the fee into the arbitration pool"
+    );
+
+    let student_before = token_client.balance(&student);
+    env.mock_all_auths_allowing_non_root_auth();
+    client.resolve_arbitration(
+        &admin,
+        &sec_admin,
+        &student,
+        &course_id,
+        &true,
+        &String::from_str(&env, "STUDENT_WON"),
+    );
+    let student_after = token_client.balance(&student);
+
+    assert_eq!(
+        client.get_arbitration_pool_balance(&token_id),
+        0,
+        "arbitration pool must be empty after a student-win resolution"
+    );
+    assert_eq!(
+        student_after - student_before,
+        pool_at_escalation,
+        "student payout must equal the pool balance recorded at escalation"
+    );
+
+    // --- Outcome 2: resolved for the instructor ---
+    let student2 = setup_arbitration(
+        &env,
+        &client,
+        &token_id,
+        &admin,
+        &instructor,
+        "COURSE-INV07-INSTRUCTOR",
+        fee_per_case,
+    );
+    let course_id2 = String::from_str(&env, "COURSE-INV07-INSTRUCTOR");
+
+    client.escalate_to_arbitration(&student2, &course_id2);
+    let pool_at_escalation2 = client.get_arbitration_pool_balance(&token_id);
+    assert_eq!(
+        pool_at_escalation2, fee_per_case,
+        "escalation must move exactly the fee into the arbitration pool"
+    );
+
+    let instructor_before = token_client.balance(&instructor);
+    env.mock_all_auths_allowing_non_root_auth();
+    client.resolve_arbitration(
+        &admin,
+        &sec_admin,
+        &student2,
+        &course_id2,
+        &false,
+        &String::from_str(&env, "INSTRUCTOR_WON"),
+    );
+    let instructor_after = token_client.balance(&instructor);
+
+    assert_eq!(
+        client.get_arbitration_pool_balance(&token_id),
+        0,
+        "arbitration pool must be empty after an instructor-win resolution"
+    );
+    assert_eq!(
+        instructor_after - instructor_before,
+        pool_at_escalation2,
+        "instructor payout must equal the pool balance recorded at escalation"
+    );
+}
+
 /// #256 — resolve_arbitration() with for_student=true must refund the fee to the caller.
 #[test]
 fn test_resolve_arbitration_refund_to_student() {
@@ -11317,6 +12731,60 @@ fn test_resolve_arbitration_refund_to_student() {
         case.resolution_reason,
         Some(String::from_str(&env, "STUDENT_WON"))
     );
+}
+
+/// `waitlist_leave` by a student who never joined must be rejected and must
+/// leave the queue contents and FIFO order untouched.
+#[test]
+fn test_waitlist_leave_non_member_rejected_preserves_queue() {
+    let (env, contract_id, token_id, admin, _sec_admin, _treasury, instructor) = setup();
+    let client = SorobanLardContractClient::new(&env, &contract_id);
+
+    let course_id_str = "COURSE-WAITLIST-NONMEMBER";
+    let course_id = String::from_str(&env, course_id_str);
+    register_and_approve_course(
+        &env,
+        &client,
+        &token_id,
+        &admin,
+        &instructor,
+        course_id_str,
+        1_000_000_000,
+    );
+
+    // Fill the course to capacity so further students must join the waitlist.
+    let course = client.get_course(&course_id).unwrap();
+    let capacity = course.max_capacity;
+    for _ in 0..capacity {
+        mint_and_enroll_student(&env, &client, &token_id, course_id_str);
+    }
+
+    let first = Address::generate(&env);
+    let second = Address::generate(&env);
+    token::StellarAssetClient::new(&env, &token_id).mint(&first, &100_000_000_000);
+    token::StellarAssetClient::new(&env, &token_id).mint(&second, &100_000_000_000);
+    client.join_waitlist(&first, &course_id);
+    client.join_waitlist(&second, &course_id);
+
+    let queue_before = client.get_waitlist(&course_id);
+    assert_eq!(queue_before.len(), 2);
+
+    // A third student who never joined must not be able to leave the queue.
+    let third = Address::generate(&env);
+    let result = client.try_waitlist_leave(&third, &course_id);
+    assert!(
+        result.is_err(),
+        "waitlist_leave must reject a student who never joined the waitlist"
+    );
+
+    let queue_after = client.get_waitlist(&course_id);
+    assert_eq!(
+        queue_after.len(),
+        2,
+        "a rejected leave must not mutate the queue"
+    );
+    assert_eq!(queue_after.get(0).unwrap(), first);
+    assert_eq!(queue_after.get(1).unwrap(), second);
 }
 
 /// #256 — resolve_arbitration() with for_student=false must pay the fee to the instructor.
@@ -13752,6 +15220,36 @@ fn test_withdraw_tokens_rejects_contract_as_destination() {
 // ISSUE #141 — cancel_upgrade signature requirement
 // ============================================================
 
+// ============================================================
+// PER-TOKEN FEE CONFIG BOUNDARY TESTS
+// ============================================================
+
+#[test]
+fn test_set_fee_config_accepts_max_bps() {
+    let (env, contract_id, token_id, admin, _sec_admin, _treasury, _instructor) = setup();
+    let client = SorobanLardContractClient::new(&env, &contract_id);
+
+    client.set_fee_config(&admin, &token_id, &10_000u32);
+
+    assert_eq!(
+        client.get_fee_config(&token_id),
+        10_000u32,
+        "set_fee_config must accept exactly 10_000 bps and store it"
+    );
+}
+
+#[test]
+fn test_set_fee_config_rejects_above_max_bps() {
+    let (env, contract_id, token_id, admin, _sec_admin, _treasury, _instructor) = setup();
+    let client = SorobanLardContractClient::new(&env, &contract_id);
+
+    let result = client.try_set_fee_config(&admin, &token_id, &10_001u32);
+    assert!(
+        result.is_err(),
+        "set_fee_config must reject a per-token fee above 10_000 bps"
+    );
+}
+
 #[test]
 fn test_cancel_upgrade_accepts_admins_in_either_order() {
     let (env, contract_id, _token_id, admin, sec_admin, _treasury, _instructor) = setup();
@@ -13800,6 +15298,7 @@ fn test_cancel_upgrade_requires_auth_from_both_admins() {
     assert!(client.get_pending_upgrade().is_some());
 }
 
+mod course_status;
 mod proptests;
 
 // ============================================================
@@ -14143,4 +15642,360 @@ fn test_current_wasm_hash_none_before_first_upgrade() {
     let client = SorobanLardContractClient::new(&env, &contract_id);
 
     assert_eq!(client.get_current_wasm_hash(), None);
+}
+
+// ============================================================
+        "COURSE-WD74B",
+        price,
+    );
+    let course_id = String::from_str(&env, "COURSE-WD74B");
+    let student = Address::generate(&env);
+    token::StellarAssetClient::new(&env, &token_id).mint(&student, &1_000_000_000);
+    client.enroll(&student, &course_id);
+
+    client.withdraw_earnings(&instructor, &token_id, &0);
+
+    let snapshot = client.get_wi
+    register_and_approve_course(
+        &env,
+        &client,
+        &token_id,
+        &admin,
+        &instructor,
+        "COURSE-WD74B",
+        price,
+    );
+    let course_id = String::from_str(&env, "COURSE-WD74B");
+    let student = Address::generate(&env);
+    token::StellarAssetClient::new(&env, &token_id).mint(&student, &1_000_000_000);
+    client.enroll(&student, &course_id);
+
+    client.withdraw_earnings(&instructor, &token_id, &0);
+
+    let snapshot = client.get_withdrawal_history(&instructor, &token_id);
+    assert_eq!(snapshot.len(), 1);
+
+    // Fetching the history a second time returns an identical result.
+    let snapshot2 = client.get_withdrawal_history(&instructor, &token_id);
+    assert_eq!(snapshot2.len(), 1);
+    assert_eq!(snapshot2.get(0).unwrap().amount, snapshot.get(0).unwrap().amount);
+
+    // The contract has no `clear_withdrawal_history` or similar endpoint;
+    // confirm the entry count has not changed.
+    assert_eq!(client.get_withdrawal_history(&instructor, &token_id).len(), 1);
+
+    // --- Additional tests from upstream ---
+    let course_id = String::from_str(&env, "COURSE-ALL-MISSING");
+    let student = Address::generate(&env);
+    enroll_and_certify(
+        &env,
+        &client,
+        &token_id,
+        &admin,
+        &instructor,
+        "COURSE-REFUND-EVT-69",
+        price,
+    );
+    let course_id = String::from_str(&env, "COURSE-REFUND-EVT-69");
+
+    // --- refund_requested ---
+    client.enroll(&student, &course_id);
+    client.request_refund(&student, &course_id);
+
+    let (rq_topics, rq_data) = find_event(&env, &contract_id, "refund_requested");
+    let rq_sym: Symbol = rq_topics.get(0).unwrap().try_into_val(&env).unwrap();
+    assert_eq!(rq_sym, Symbol::new(&env, "refund_requested"));
+    let rq_topic_course: String = rq_topics.get(1).unwrap().try_into_val(&env).unwrap();
+    assert_eq!(rq_topic_course, course_id);
+
+    let (rq_student, rq_course, rq_amount): (Address, String, i128) =
+        rq_data.try_into_val(&env).unwrap();
+    assert_eq!(rq_student, student);
+    assert_eq!(rq_course, course_id);
+    assert_eq!(rq_amount, price);
+
+    // --- refund_processed (approved) ---
+    env.mock_all_auths_allowing_non_root_auth();
+    client.process_refund(&admin, &student, &course_id, &true);
+
+    let (rp_topics, rp_data) = find_event(&env, &contract_id, "refund_processed");
+    let rp_sym: Symbol = rp_topics.get(0).unwrap().try_into_val(&env).unwrap();
+    assert_eq!(rp_sym, Symbol::new(&env, "refund_processed"));
+    let rp_topic_course: String = rp_topics.get(1).unwrap().try_into_val(&env).unwrap();
+    assert_eq!(rp_topic_course, course_id);
+
+    let (rp_student, rp_course, rp_approved, rp_admin): (Address, String, bool, Address) =
+        rp_data.try_into_val(&env).unwrap();
+    assert_eq!(rp_student, student);
+    assert_eq!(rp_course, course_id);
+    assert!(rp_approved);
+    assert_eq!(rp_admin, admin);
+
+    // --- refund_processed (rejected) ---
+    let student_b = Address::generate(&env);
+    token::StellarAssetClient::new(&env, &token_id).mint(&student_b, &100_000_000_000);
+
+    register_and_approve_course(
+        &env,
+        &client,
+        &token_id,
+        &admin,
+        &instructor,
+        "COURSE-REFUND-EVT-69B",
+        price,
+    );
+    let course_id_b = String::from_str(&env, "COURSE-REFUND-EVT-69B");
+
+    client.enroll(&student_b, &course_id_b);
+    client.request_refund(&student_b, &course_id_b);
+    client.process_refund(&admin, &student_b, &course_id_b, &false);
+
+    let (rp2_topics, rp2_data) = find_event(&env, &contract_id, "refund_processed");
+    let rp2_sym: Symbol = rp2_topics.get(0).unwrap().try_into_val(&env).unwrap();
+    assert_eq!(rp2_sym, Symbol::new(&env, "refund_processed"));
+    let rp2_topic_course: String = rp2_topics.get(1).unwrap().try_into_val(&env).unwrap();
+    assert_eq!(rp2_topic_course, course_id_b);
+
+    let (rp2_student, rp2_course, rp2_approved, rp2_admin): (Address, String, bool, Address) =
+        rp2_data.try_into_val(&env).unwrap();
+    assert_eq!(rp2_student, student_b);
+    assert_eq!(rp2_course, course_id_b);
+    assert!(!rp2_approved);
+    assert_eq!(rp2_admin, admin);
+}
+
+/// #70 — Archived enrollment records cannot be refunded twice.
+///
+/// After a refund, the enrollment is archived to EnrollmentHistory with
+/// `is_refunded = true` and removed from active storage. A second refund
+/// attempt — whether via `process_refund` or `archive_course` — must not
+/// transfer tokens or append another refunded history entry.
+#[test]
+fn test_archived_enrollment_cannot_be_refunded_twice() {
+    let (env, contract_id, token_id, admin, sec_admin, _treasury, instructor) = setup();
+    let client = SorobanLardContractClient::new(&env, &contract_id);
+    let token_client = token::Client::new(&env, &token_id);
+
+    let student = Address::generate(&env);
+    token::StellarAssetClient::new(&env, &token_id).mint(&student, &100_000_000_000);
+
+    register_and_approve_course(
+        &env,
+        &client,
+        &token_id,
+        &admin,
+        &instructor,
+        "COURSE-DOUBLE-REFUND-70",
+        1_000_000_000,
+    );
+    let course_id = String::from_str(&env, "COURSE-DOUBLE-REFUND-70");
+
+    // --- First refund succeeds ---
+    client.enroll(&student, &course_id);
+    client.request_refund(&student, &course_id);
+    let balance_before = token_client.balance(&student);
+    env.mock_all_auths_allowing_non_root_auth();
+    client.process_refund(&admin, &student, &course_id, &true);
+    let balance_after = token_client.balance(&student);
+    assert_eq!(balance_after - balance_before, 1_000_000_000);
+
+    // History has exactly one refunded entry.
+    let history = client.get_enrollment_history(&admin, &student, &course_id);
+    assert_eq!(history.len(), 1);
+    assert!(history.get(0).unwrap().is_refunded);
+
+    // --- Second process_refund must fail (request is no longer Pending) ---
+    let result = client.try_process_refund(&admin, &student, &course_id, &true);
+    assert!(
+        result.is_err(),
+        "second process_refund must fail — request is not pending"
+    );
+
+    // No additional tokens transferred.
+    assert_eq!(
+        token_client.balance(&student),
+        balance_after,
+        "no additional tokens after failed second refund"
+    );
+    // No additional history entry.
+    assert_eq!(
+        client
+            .get_enrollment_history(&admin, &student, &course_id)
+            .len(),
+        1,
+        "no additional history entry after failed second refund"
+    );
+
+    // --- archive_course also cannot double-refund ---
+    // The enrollment was removed from active storage by process_refund, so
+    // archive_course's `has(&enrollment_key)` check returns false and the
+    // student is skipped entirely — no transfer, no history entry.
+    client.pause_course(&admin, &course_id);
+    let mut refund_list = soroban_sdk::Vec::new(&env);
+    refund_list.push_back(student.clone());
+    client.archive_course(&admin, &sec_admin, &course_id, &Some(refund_list));
+
+    assert_eq!(
+        token_client.balance(&student),
+        balance_after,
+        "archive_course must not double-refund an already-refunded enrollment"
+    );
+    assert_eq!(
+        client
+            .get_enrollment_history(&admin, &student, &course_id)
+            .len(),
+        1,
+        "archive_course must not append a second refunded history entry"
+    );
+}
+
+#[test]
+fn test_bulk_revoke_all_missing_certificates() {
+    let (env, contract_id, token_id, admin, _sec, _treasury, instructor) = setup();
+    let client = SorobanLardContractClient::new(&env, &contract_id);
+
+    register_and_approve_course(
+        &env,
+        &client,
+        &token_id,
+        &admin,
+        &instructor,
+        "COURSE-ALL-MISSING",
+        100_000_000,
+    );
+    let course_id = String::from_str(&env, "COURSE-ALL-MISSING");
+    let student = Address::generate(&env);
+    enroll_and_certify(
+        &env,
+        &client,
+        &token_id,
+        &admin,
+        &student,
+        "COURSE-ALL-MISSING",
+        "CERT-ALL-MISSING-0",
+    );
+
+    // Remove the only certificate record — the index still lists it.
+    env.as_contract(&contract_id, || {
+        env.storage()
+            .persistent()
+            .remove(&DataKey::Certificate(String::from_str(
+                &env,
+                "CERT-ALL-MISSING-0",
+            )));
+    });
+
+    // No panic, no live certificates to revoke — returns 0 deterministically.
+    let revoked_count = client.bulk_revoke_course_certificates(&admin, &course_id);
+    assert_eq!(revoked_count, 0);
+
+    // The index is still intact.
+    assert_eq!(client.get_course_certificates(&course_id).len(), 1);
+}
+
+#[should_panic(expected = "register_course: category name too long")]
+fn test_register_course_category_too_long_panics() {
+    let (env, contract_id, token_id, _admin, _sec, _treasury, instructor) = setup();
+    let client = SorobanLardContractClient::new(&env, &contract_id);
+    let mut cats = soroban_sdk::Vec::new(&env);
+    cats.push_back(String::from_str(&env, &"x".repeat(65)));
+    client.register_course(
+        &instructor,
+        &String::from_str(&env, "LEN-PANIC"),
+        &1_000_000_000,
+        &token_id,
+        &0u32,
+        &None,
+        &BytesN::from_array(&env, &[1u8; 32]),
+        &cats,
+    );
+}
+
+#[test]
+fn test_enroll_rejected_at_capacity_no_side_effects() {
+    let (env, contract_id, token_id, admin, _sec, treasury, instructor) = setup();
+    let client = SorobanLardContractClient::new(&env, &contract_id);
+    let token = token::Client::new(&env, &token_id);
+    register_and_approve_capped_course(
+        &env, &client, &token_id, &admin, &instructor, "CAP-FULL", 1_000_000_000, 2,
+    );
+    let cid = String::from_str(&env, "CAP-FULL");
+
+    client.enroll(&funded_student(&env, &token_id), &cid);
+    client.enroll(&funded_student(&env, &token_id), &cid);
+    let course = client.get_course(&cid).unwrap();
+    assert_eq!(course.total_enrollments, 2);
+    assert_eq!(course.active_enrollments, 2);
+
+    let extra = funded_student(&env, &token_id);
+    let extra_bal = token.balance(&extra);
+    let treasury_bal = token.balance(&treasury);
+    let contract_bal = token.balance(&contract_id);
+    let total_active = client.get_total_active_enrollments();
+
+    assert!(client.try_enroll(&extra, &cid).is_err());
+
+    // No transfer, no enrollment record, no counter increment.
+    assert_eq!(token.balance(&extra), extra_bal);
+    assert_eq!(token.balance(&treasury), treasury_bal);
+    assert_eq!(token.balance(&contract_id), contract_bal);
+    assert!(!client.is_enrolled(&extra, &cid));
+    let course = client.get_course(&cid).unwrap();
+    assert_eq!(course.total_enrollments, 2);
+    assert_eq!(course.active_enrollments, 2);
+    assert_eq!(client.get_total_active_enrollments(), total_active);
+}
+
+#[test]
+#[should_panic(expected = "course has reached maximum enrollment capacity")]
+fn test_enroll_at_capacity_panics() {
+    let (env, contract_id, token_id, admin, _sec, _treasury, instructor) = setup();
+    let client = SorobanLardContractClient::new(&env, &contract_id);
+    register_and_approve_capped_course(
+        &env, &client, &token_id, &admin, &instructor, "CAP-ONE", 1_000_000_000, 1,
+    );
+    let cid = String::from_str(&env, "CAP-ONE");
+    client.enroll(&funded_student(&env, &token_id), &cid);
+    client.enroll(&funded_student(&env, &token_id), &cid);
+}
+
+#[test]
+fn test_capacity_released_after_refund() {
+    let (env, contract_id, token_id, admin, _sec, _treasury, instructor) = setup();
+    let client = SorobanLardContractClient::new(&env, &contract_id);
+    client.update_refund_window(&admin, &10u32);
+    register_and_approve_capped_course(
+        &env, &client, &token_id, &admin, &instructor, "CAP-REFUND", 1_000_000_000, 2,
+    );
+    let cid = String::from_str(&env, "CAP-REFUND");
+
+    let s1 = funded_student(&env, &token_id);
+    let s2 = funded_student(&env, &token_id);
+    client.enroll(&s1, &cid);
+    client.enroll(&s2, &cid);
+    let c = client.get_course(&cid).unwrap();
+    assert_eq!((c.total_enrollments, c.active_enrollments), (2, 2));
+    assert_eq!(client.get_total_active_enrollments(), 2);
+
+    let s3 = funded_student(&env, &token_id);
+    assert!(client.try_enroll(&s3, &cid).is_err());
+
+    client.request_refund(&s1, &cid);
+    env.mock_all_auths_allowing_non_root_auth();
+    client.process_refund(&admin, &s1, &cid, &true);
+    assert!(!client.is_enrolled(&s1, &cid));
+    let c = client.get_course(&cid).unwrap();
+    assert_eq!((c.total_enrollments, c.active_enrollments), (1, 1));
+    assert_eq!(client.get_total_active_enrollments(), 1);
+
+    // The released seat can be taken by a new student.
+    client.enroll(&s3, &cid);
+    assert!(client.is_enrolled(&s3, &cid));
+    let c = client.get_course(&cid).unwrap();
+    assert_eq!((c.total_enrollments, c.active_enrollments), (2, 2));
+    assert_eq!(client.get_total_active_enrollments(), 2);
+
+    // And the course is full again.
+    let s4 = funded_student(&env, &token_id);
+    assert!(client.try_enroll(&s4, &cid).is_err());
 }

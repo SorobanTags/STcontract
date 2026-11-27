@@ -1,19 +1,62 @@
-# Contributing to SorobanLard
+# Contributing
 
-Thanks for your interest in contributing! This guide covers how the contract is
-organized, the conventions we follow, and how to get your change merged.
+Thanks for your interest in improving this project. This document covers the
+basics of setting up a development environment, running the test suite, and
+submitting changes.
 
-## Repository layout
+## Getting started
 
-The core contract lives in a single large file:
+1. Fork the repository and clone your fork locally.
+2. Install dependencies with your package manager of choice.
+3. Create a topic branch for your change (for example `fix/revoked-cert-example`).
 
-```
-contracts/sorobanlard/
-├── src/
-│   ├── lib.rs      # the entire contract (6000+ lines)
-│   └── test.rs     # the test suite (291 tests)
-├── Makefile        # build / optimize targets
-└── Cargo.toml
+## Running validation
+
+Before opening a pull request, run the relevant validation and report the exact
+command and its result in the pull request description. For example:
+
+## Contract workspace layout
+
+Use this map to find where each kind of change belongs:
+
+| Path | What lives here |
+| --- | --- |
+| `contracts/sorobanlard/src/lib.rs` | All contract logic: types, storage keys, and the `impl` block with public functions. |
+| `contracts/sorobanlard/src/test.rs` | The main test suite (unit and integration-style tests). |
+| `contracts/sorobanlard/src/test/proptests.rs` | Property-based tests. |
+| `scripts/` | Tooling such as `check_readme_api.py` (README/API signature check) and `check_invariants.sh` (invariant checks). |
+| `fuzz/` | Fuzz targets. |
+| `DEPLOYMENTS.md` | Deployment configuration and records. |
+| `contracts/sorobanlard/.env.example` | Example environment variables for deployment. |
+| `contracts/sorobanlard/Makefile` | Build / optimize / deployment targets. |
+
+### Change-to-file map
+
+| Contribution | Where to make the change |
+| --- | --- |
+| New contract function | `contracts/sorobanlard/src/lib.rs` (inside the `impl` block, near related feature code), plus a doc comment and a `README.md` update. |
+| New test | `contracts/sorobanlard/src/test.rs` (or `src/test/proptests.rs` for property-based tests). |
+| New fuzz target | `fuzz/` (add the target and register it in the fuzz manifest). |
+| New panic message | The panic site in `contracts/sorobanlard/src/lib.rs`, plus a row in `ERRORS.md`. |
+| Deployment change | `DEPLOYMENTS.md`, `contracts/sorobanlard/.env.example`, and `contracts/sorobanlard/Makefile` as applicable. |
+
+### Verifying your change
+
+Run the checks relevant to what you touched, and report the exact command and
+result in the pull request description:
+
+```sh
+# Contract logic or tests
+cargo test
+
+# README/API signature consistency
+python3 scripts/check_readme_api.py
+
+# Invariant checks
+bash scripts/check_invariants.sh
+
+# Fuzz targets (from the fuzz workspace)
+cargo fuzz build
 ```
 
 ### How `lib.rs` is organized
@@ -60,6 +103,9 @@ cargo test
 # Lint (must be clean)
 cargo clippy --all-targets -- -D warnings
 
+# Check that README contract-function signatures match lib.rs
+make check-api
+
 # Build the wasm artifact
 make build
 
@@ -67,43 +113,49 @@ make build
 make optimize
 ```
 
-### Adding a test
+## Submitting changes
 
-All tests live in `src/test.rs`. To add a test:
+- Keep changes scoped to the issue you are addressing.
+- Update directly related documentation alongside code changes.
+- Add focused regression tests for behavior changes. Documentation-only changes
+  should include verifiable commands or examples.
+- Do not include credentials, tokens, or other secrets in code, tests, or docs.
 
-1. Add a `#[test]` function to `test.rs` following the naming and setup patterns
-   of the surrounding tests.
-2. Reuse the existing test helpers/fixtures rather than duplicating setup.
-3. Cover both the success path and relevant failure/panic paths.
-4. Run `cargo test` and confirm the new test passes alongside the existing suite.
+## Example: verifying a revoked certificate
 
-## Pull request checklist
+The CLI can verify a certificate against the current revocation state. The
+example below uses a placeholder certificate path and a placeholder issuer
+identifier — substitute your own values. No credentials are required for this
+invocation.
 
-Before opening a PR, please confirm:
+```sh
+# Verify a certificate after it has been revoked.
+# Expected result: the command exits successfully and prints `false`,
+# indicating the certificate no longer verifies.
+cert-cli verify --cert ./path/to/certificate.pem --issuer example-issuer
+```
 
-- [ ] The change is covered by tests (new behavior needs new tests).
-- [ ] `cargo test` passes.
-- [ ] `cargo clippy --all-targets -- -D warnings` is clean.
-- [ ] New public functions have doc comments.
-- [ ] New storage keys follow the `DataKey` / `DataKey2` rules above.
-- [ ] The change stays focused on the linked issue.
+Expected output:
 
-## Error and panic messages
+```text
+false
+```
 
-Before adding or changing any panic message or error condition, read
-[`ERRORS.md`](ERRORS.md). It is the canonical mapping from contract failures
-to user-facing API error responses in the backend.
+### Inspecting the revocation record
 
-### Why `DataKey` and `DataKey2` are split
+To confirm why verification returned `false`, inspect the revocation record for
+the certificate:
 
-`#[contracttype]` enums are limited to **50 variants** in the generated XDR.
-`lib.rs` therefore splits storage keys across two enums so the contract can
-keep growing without hitting that ceiling:
+```sh
+# Show the revocation record for the certificate serial number.
+cert-cli revocation show --serial 00A1B2C3D4
+```
 
-- `DataKey` — the original key enum, now **full** (50 / 50 variants, 0
-  headroom). Do not add variants to it.
-- `DataKey2` — the overflow enum for new keys. Check its current variant count
-  and remaining headroom in the enum comment in `lib.rs` before adding a key.
+The record lists the revocation timestamp and reason. If no record is returned,
+the certificate has not been revoked and verification should return `true`.
+
+> Note: the commands above reflect the current public CLI contract. If the
+> interface changes, update this example in the same pull request.
 
 ### Where new keys go
 
@@ -174,6 +226,8 @@ CI runs `python3 scripts/check_readme_api.py`, which fails if a documented
 `name(...)` call has a different number of arguments than the matching
 `pub fn` in `lib.rs`. It only warns about public functions the README does
 not mention yet.
+
+Run `make check-api` from `contracts/sorobanlard/` to run the same check locally.
 
 ## Dependency advisories
 

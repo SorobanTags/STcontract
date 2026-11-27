@@ -67,6 +67,11 @@ struct Enrolled {
     student: Address,
     course_id: String,
     student_start: i128,
+    treasury_balance_start: i128,
+    contract_balance_start: i128,
+    instructor_balance_start: i128,
+    instructor_earnings_start: i128,
+    instructor_total_earnings_start: i128,
 }
 
 fn enroll_with(price: i128, token_fee_bps: u32, course_fee_pct: u32) -> Enrolled {
@@ -100,7 +105,13 @@ fn enroll_with(price: i128, token_fee_bps: u32, course_fee_pct: u32) -> Enrolled
     if price > 0 {
         token::StellarAssetClient::new(&env, &token_id).mint(&student, &price);
     }
-    let student_start = token::Client::new(&env, &token_id).balance(&student);
+    let token_client = token::Client::new(&env, &token_id);
+    let student_start = token_client.balance(&student);
+    let treasury_balance_start = token_client.balance(&treasury);
+    let contract_balance_start = token_client.balance(&contract_id);
+    let instructor_balance_start = token_client.balance(&instructor);
+    let instructor_earnings_start = client.get_instructor_earnings(&instructor, &token_id);
+    let instructor_total_earnings_start = client.get_instructor_total_earnings(&instructor);
 
     client.enroll(&student, &course_id);
 
@@ -114,6 +125,11 @@ fn enroll_with(price: i128, token_fee_bps: u32, course_fee_pct: u32) -> Enrolled
         student,
         course_id,
         student_start,
+        treasury_balance_start,
+        contract_balance_start,
+        instructor_balance_start,
+        instructor_earnings_start,
+        instructor_total_earnings_start,
     }
 }
 
@@ -151,6 +167,35 @@ proptest! {
             prop_assert!(fee >= 0 && fee <= amount);
             prop_assert!(net >= 0 && net <= amount);
         }
+    }
+
+    /// For every generated `(amount, bps, override_bps)` with `amount >= 0`,
+    /// neither the platform fee nor the instructor share ever exceeds `amount`,
+    /// and the two shares always sum to `amount`.
+    #[test]
+    fn prop_deduct_fee_shares_never_exceed_amount(
+        amount in prop_oneof![
+            1 => Just(0i128),
+            1 => Just(1i128),
+            1 => Just(i128::MAX / 10_000),
+            7 => 0i128..=(i128::MAX / 10_000),
+        ],
+        bps in fee_bps(),
+        override_bps in proptest::option::of(0u32..=10_000),
+    ) {
+        let (env, contract_id, token_id, admin, _sec_admin, _treasury, _instructor) = setup();
+        let client = SorobanLardContractClient::new(&env, &contract_id);
+        client.set_fee_config(&admin, &token_id, &bps);
+
+        let (instructor, platform) = env.as_contract(&contract_id, || {
+            SorobanLardContract::deduct_fee(&env, &token_id, amount, override_bps, false, false)
+        });
+
+        prop_assert!(platform >= 0);
+        prop_assert!(instructor >= 0);
+        prop_assert!(platform <= amount);
+        prop_assert!(instructor <= amount);
+        prop_assert_eq!(platform + instructor, amount);
     }
 
     /// When `amount * fee_bps` cannot be represented in an i128 the fee
@@ -206,6 +251,89 @@ proptest! {
         prop_assert_eq!(client.get_instructor_total_earnings(&e.instructor), instructor);
     }
 
+    /// A free enrollment leaves every token balance and instructor earnings
+    /// unchanged, regardless of the configured fee inputs.
+    #[test]
+    fn prop_zero_price_enroll_moves_no_tokens(
+        token_fee in fee_bps(),
+        course_fee_pct in 0u32..=100,
+    ) {
+        let e = enroll_with(0, token_fee, course_fee_pct);
+        let client = SorobanLardContractClient::new(&e.env, &e.contract_id);
+        let token_client = token::Client::new(&e.env, &e.token_id);
+
+        prop_assert_eq!(token_client.balance(&e.student), e.student_start);
+        prop_assert_eq!(token_client.balance(&e.treasury), e.treasury_balance_start);
+        prop_assert_eq!(token_client.balance(&e.instructor), e.instructor_balance_start);
+        prop_assert_eq!(token_client.balance(&e.contract_id), e.contract_balance_start);
+        prop_assert_eq!(
+            client.get_instructor_earnings(&e.instructor, &e.token_id),
+            e.instructor_earnings_start
+        );
+        prop_assert_eq!(
+            client.get_instructor_total_earnings(&e.instructor),
+            e.instructor_total_earnings_start
+        );
+    }
+
+    /// Issue #77: for prices that are not multiples of 100 the percentage
+    /// split leaves a division remainder. The documented rule is truncation:
+    /// `platform = price * pct / 100` (integer division, remainder dropped),
+    /// and the remainder is retained by the instructor share so that
+    /// `platform + instructor == price` exactly.
+    #[test]
+    fn prop_fee_split_rounding_for_non_hundred_prices(
+        price in (MIN_PRICE..=MAX_PRICE).prop_filter(
+            "price must not be divisible by 100",
+            |p| p % 100 != 0,
+        ),
+        token_fee in fee_bps(),
+        course_fee_pct in 1u32..=100,
+    ) {
+        let e = enroll_with(price, token_fee, course_fee_pct);
+        let client = SorobanLardContractClient::new(&e.env, &e.contract_id);
+
+        let enrollment = client
+            .get_enrollment(&e.student, &e.student, &e.course_id)
+            .unwrap();
+        let platform = enrollment.platform_amount;
+        let instructor = enrollment.instructor_amount;
+
+        // The effective percentage is the course override, floored at the
+        // live per-token rate (mirrors `enroll_with`'s normalisation).
+        let effective_pct = course_fee_pct.max((token_fee + 99) / 100) as i128;
+
+        prop_assert_eq!(enrollment.amount_paid, price);
+        prop_assert_eq!(platform, price * effective_pct / 100);
+        prop_assert_eq!(platform + instructor, price);
+        prop_assert!(platform >= 0 && instructor >= 0);
+        // The remainder (if any) is retained by the instructor share.
+        prop_assert_eq!(instructor, price - price * effective_pct / 100);
+
+        prop_assert_eq!(token_client.balance(&e.student), e.student_start - price);
+        prop_assert_eq!(token_client.balance(&e.treasury), platform);
+        prop_assert_eq!(token_client.balance(&e.contract_id), instructor);
+        prop_assert_eq!(
+            client.get_instructor_earnings(&e.instructor, &e.token_id),
+            instructor
+        );
+        prop_assert_eq!(client.get_instructor_total_earnings(&e.instructor), instructor);
+    }
+
+    /// `withdraw_earnings()` moves exactly the requested amount (or the full
+    /// balance for `amount = 0`), never leaves a negative balance, and
+    /// rejects over-withdrawals and negative amounts.
+    #[test]
+    fn prop_withdraw_earnings_conserves_value(
+        price in course_price(),
+        token_fee in fee_bps(),
+        withdraw_permille in 0u32..=1_000,
+        over_by in 1i128..=i128::MAX / 2,
+        negative in i128::MIN..0i128,
+    ) {
+        let e = enroll_with(pric
+    }
+
     /// `withdraw_earnings()` moves exactly the requested amount (or the full
     /// balance for `amount = 0`), never leaves a negative balance, and
     /// rejects over-withdrawals and negative amounts.
@@ -249,6 +377,113 @@ proptest! {
             client.get_instructor_earnings(&e.instructor, &e.token_id),
             remaining
         );
+    }
+
+    /// An approved refund restores the platform (treasury) and instructor
+    /// splits exactly: each party's token balance returns to its pre-enrollment
+    /// value.
+    #[test]
+    fn prop_process_refund_restores_balances(
+        price in course_price(),
+        token_fee in fee_bps(),
+        course_fee_pct in 0u32..=100,
+    ) {
+        if price == 0 {
+            return Ok(());
+        }
+        let e = enroll_with(price, token_fee, course_fee_pct);
+        let client = SorobanLardContractClient::new(&e.env, &e.contract_id);
+        let token_client = token::Client::new(&e.env, &e.token_id);
+
+        // Snapshot balances immediately after enrollment so we know exactly
+        // how much each party received. The pre-enrollment values are these
+        // minus the enrollment split (all parties started at 0 before the
+        // enrollment in the fresh env, so the pre-enrollment values are 0).
+        let enrollment = client
+            .get_enrollment(&e.student, &e.student, &e.course_id)
+            .unwrap();
+        let treasury_pre = token_client.balance(&e.treasury) - enrollment.platform_amount;
+        let instructor_pre = client.get_instructor_earnings(&e.instructor, &e.token_id)
+            - enrollment.instructor_amount;
+
+        client.request_refund(&e.student, &e.course_id);
+        e.env.mock_all_auths_allowing_non_root_auth();
+        client.process_refund(&e.admin, &e.student, &e.course_id, &true);
+
+        prop_assert_eq!(token_client.balance(&e.treasury), treasury_pre,
+            "treasury balance should be restored to pre-enrollment value");
+        prop_assert_eq!(
+            client.get_instructor_earnings(&e.instructor, &e.token_id),
+            instructor_pre,
+            "instructor earnings should be restored to pre-enrollment value"
+        );
+        prop_assert_eq!(token_client.balance(&e.student), e.student_start,
+            "student balance should be restored to pre-enrollment value");
+    }
+
+    /// A zero per-course fee override means "inherit the global default",
+    /// not "free": for any price and default rate, a course registered with
+    /// `Some(0)` must charge exactly the same split as one registered with
+    /// `None`, and that split must still conserve value.
+    #[test]
+    fn prop_zero_fee_override_inherits_default(
+        price in course_price(),
+        token_fee in fee_bps(),
+    ) {
+        let e_none = enroll_with(price, token_fee, 0);
+        let client_none = SorobanLardContractClient::new(&e_none.env, &e_none.contract_id);
+        let enrollment_none = client_none
+            .get_enrollment(&e_none.student, &e_none.student, &e_none.course_id)
+            .unwrap();
+
+        // Register a second course with an explicit zero override and the
+        // same default fee configuration.
+        let (env, contract_id, token_id, admin, _sec_admin, treasury, instructor) = setup();
+        let client = SorobanLardContractClient::new(&env, &contract_id);
+        client.set_fee_config(&admin, &token_id, &token_fee);
+
+        let course_id = String::from_str(&env, "PROP-ZERO-OVERRIDE");
+        client.register_course(
+            &instructor,
+            &course_id,
+            &price,
+            &token_id,
+            &0u32,
+            &Some(0u32),
+            &BytesN::from_array(&env, &[2u8; 32]),
+            &soroban_sdk::Vec::new(&env),
+        );
+        env.ledger().with_mut(|l| {
+            l.sequence_number += 1;
+        });
+        client.approve_course(&admin, &course_id);
+
+        let student = Address::generate(&env);
+        if price > 0 {
+            token::StellarAssetClient::new(&env, &token_id).mint(&student, &price);
+        }
+        client.enroll(&student, &course_id);
+
+        let enrollment_zero = client
+            .get_enrollment(&student, &student, &course_id)
+            .unwrap();
+
+        prop_assert_eq!(enrollment_zero.amount_paid, price);
+        prop_assert_eq!(enrollment_zero.platform_amount, enrollment_none.platform_amount);
+        prop_assert_eq!(enrollment_zero.instructor_amount, enrollment_none.instructor_amount);
+        prop_assert_eq!(
+            enrollment_zero.platform_amount + enrollment_zero.instructor_amount,
+            price
+        );
+        prop_assert_eq!(
+            token::Client::new(&env, &token_id).balance(&treasury),
+            enrollment_zero.platform_amount
+        );
+        prop_assert_eq!(
+            client.get_instructor_earnings(&instructor, &token_id),
+            enrollment_zero.instructor_amount
+        );
+    }
     }
 
     /// An approved refund returns exactly what was paid: the student is made

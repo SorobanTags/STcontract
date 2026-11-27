@@ -112,7 +112,10 @@ append-only collections. The rule of thumb for new keys is:
 
 Every current `DataKey` / `DataKey2` variant is classified in
 [docs/storage-keys.md](docs/storage-keys.md), along with the rationale and the
-race-freedom argument for `TotalActiveEnrollments`.
+race-freedom argument for `TotalActiveEnrollments`. Per-record TTL renewal
+(and which records can expire after inactivity) is in
+[docs/storage-ttl.md](docs/storage-ttl.md). Before changing any key or stored
+struct, follow [docs/storage-key-checklist.md](docs/storage-key-checklist.md).
 
 ---
 
@@ -244,8 +247,16 @@ Bulk revocation currently loads the full index and processes it in one
 transaction, so cost grows linearly and an arbitrarily large uncapped course
 can exceed transaction limits. The chosen policy is not to impose a new
 implicit issuance cap; use `max_certificates` when a course needs an enforced
-ceiling. Truly large uncapped courses need a paginated revocation API and an
-index representation that does not load the full list per page.
+ceiling. For truly large uncapped courses, `bulk_revoke_certificates_paged`
+processes the index in bounded pages so a single transaction never touches the
+full list — see the function table below.
+
+`bulk_revoke_course_certificates` preserves every certificate record and the
+`CourseCertificates(course_id)` index: records remain queryable via
+`get_certificate` and `verify_certificate` (which now returns `false`), the
+`revoked` flag is set on each certificate, and the returned count is the exact
+number of certificates revoked. This is covered by the bulk-revocation
+regression tests in `src/test.rs`.
 
 `EnrollmentHistory(student, course_id)` is also append-only and has no
 contract-level cap or pruning function. Each `re_enroll()` archives the full
@@ -293,7 +304,8 @@ Initialises the contract. Called once by the deployer, immediately after deploym
 | `mark_completed(admin, student, course_id, evidence_hash)` | Admin | Called after backend verifies all lessons done. A non-empty `evidence_hash` replaces the student co-signature. |
 | `issue_certificate(admin, student, course_id, cert_id, course_title, enrollment_reference, expires_at_ledger, instructor_signature)` | Admin | Issues on-chain certificate. Requires completion. `enrollment_reference` is a free-form backend ID (e.g. UUID). |
 | `revoke_certificate(admin, certificate_id, reason)` | Admin | Flags certificate as revoked |
-| `bulk_revoke_course_certificates(admin, course_id)` | Admin | Flags every certificate of a course as revoked in one transaction |
+| `bulk_revoke_course_certificates(admin, course_id)` | Admin | Flags every certificate of a course as revoked in one transaction. Index entries whose Certificate record has expired from storage are skipped so live certificates are never silently passed over. |
+| `bulk_revoke_certificates_paged(admin, course_id, cursor, limit)` | Admin | Paginated bulk revocation — processes a bounded slice of the certificate index per call. Returns `BulkRevokePage { revoked_count, processed, next_cursor }`. Repeat with the returned `next_cursor` until it is `None`. Safe to retry a page: `apply_revocation` is idempotent so already-revoked certificates are not double-counted. |
 
 ### Admin management
 
@@ -313,7 +325,20 @@ Initialises the contract. Called once by the deployer, immediately after deploym
 | `is_enrolled(student, course_id)` | `bool` |
 | `has_completed(student, course_id)` | `bool` |
 | `verify_certificate(certificate_id)` | `bool` — true if exists and not revoked |
+| `get_revocation_challenge(caller, certificate_id)` | Revocation challenge status and deadline (see below) |
 | `get_platform_fee(admin)` | `u32` — current default fee % (admin only) |
+
+`get_revocation_challenge(caller, certificate_id)` returns read-only data about
+a pending certificate revocation challenge:
+
+- `status` — the challenge state (e.g. open/pending vs. completed/resolved)
+- `deadline` — the ledger sequence at which the challenge window closes
+
+Authorization: the caller must be the certificate's student, the course
+instructor, or an admin; any other caller is rejected as unauthorized. When no
+challenge exists for the certificate, the query returns no challenge data
+(`None`). The query never mutates state. Open, completed, and unauthorized
+cases are covered by the revocation-challenge regression tests in `src/test.rs`.
 
 ---
 
@@ -331,9 +356,33 @@ instructor_amount = 100 - 20       = 80 USDC → instructor
 
 Both transfers are atomic — if either fails, the whole transaction reverts. The student is never charged without the instructor and treasury being paid.
 
+**Rounding rule.** The platform share is computed as
+`platform_amount = price * platform_fee_percent / 100` using integer
+truncation (the fractional stroop is discarded). The instructor share is
+`instructor_amount = price - platform_amount`, so the remainder from the
+division is always retained by the instructor. As a result,
+`platform_amount + instructor_amount == price` exactly for every price and
+percentage, including prices not divisible by 100. For example, with
+`price = 101` and `platform_fee_percent = 20`, `platform_amount = 20`
+(20.2 truncated) and `instructor_amount = 81`. This is covered by the
+fee-split rounding regression tests in `src/test.rs`.
+
 The platform fee percentage can be:
 - **Global default** (set at `init`, updatable by admin)
-- **Per-course override** (set by instructor at registration time, non-zero value)
+- **Per-course override** (set by instructor at registration time)
+
+**Zero per-course fee semantics:** a `platform_fee_pct` of `0` passed to `register_course` is **not** an explicit "free" override — it means *inherit the global default fee*. Only a non-zero per-course value is treated as an explicit per-course fee. To make a course genuinely free, set `price = 0` (the enrollment then splits a zero amount); do not rely on a `0` fee override. This rule is locked by the registration and enrollment regression tests (`test_register_course_custom_fee` and the zero-fee enrollment tests).
+
+### Approved tokens
+
+`add_approved_token` / `remove_approved_token` control which tokens may be
+used for **new** enrollments. Removing an approved token blocks new
+enrollments that use that token only; it does not affect existing enrollments,
+refunds, withdrawals, or any other outstanding obligation. Courses already
+registered with that token keep their records, and students already enrolled
+can still complete, be refunded, and have their instructor earnings withdrawn
+under the normal rules. This behavior is covered by the approved-token removal
+regression tests in `src/test.rs`.
 
 ---
 
@@ -349,7 +398,13 @@ stellar contract invoke \
   --certificate_id "CERT-12345-TAILORING"
 ```
 
-Returns `true` if the certificate exists and has not been revoked. The `get_certificate()` function returns the full record including the student's Stellar address, course title, instructor, and issuance ledger — all permanently recorded and independently auditable.
+Returns `true` if the certificate exists, has not been revoked, and has not expired. The `get_certificate()` function returns the full record including the student's Stellar address, course title, instructor, and issuance ledger — all permanently recorded and independently auditable.
+
+**Expiry rule:** a certificate with `expires_at_ledger = Some(n)` is valid while the current ledger is strictly less than `n` (`ledger < n`) and is expired at and after `n` (`ledger >= n`). `verify_certificate` returns `false` for an expired certificate. A certificate with `expires_at_ledger = None` never expires. The boundary is covered by the certificate-expiration regression tests.
+
+**Issuance signature rule:** `issue_certificate` requires an `instructor_signature` that matches the course instructor. A missing or mismatched signature is rejected and no certificate record or `certificate_issued` event is created.
+
+**Revocation challenge-period boundary:** after `revoke_certificate`, a student may challenge the revocation while the current ledger is strictly less than the configured `revocation_deadline` (`ledger < revocation_deadline`). At and after the deadline (`ledger >= revocation_deadline`) the revocation is permanent and finalization succeeds. The boundary is covered by the revocation challenge-period regression tests.
 
 ---
 
@@ -408,15 +463,34 @@ sorobanlard-contract/
 
 ## Prerequisites
 
+The local development environment is pinned to the toolchain below. Anything
+newer usually works, but these are the versions the test suite and build are
+validated against.
+
+| Tool | Supported version | Install / verify |
+|---|---|---|
+| Rust | stable, 1.84.0 or newer (edition 2021) | `rustup show` |
+| `wasm32v1-none` target | required for `make build` | `rustup target add wasm32v1-none` |
+| Stellar CLI | 22.x (`stellar-cli` with the `opt` feature) | `cargo install --locked stellar-cli --features opt` |
+
 ```bash
-# Rust + wasm32 target
+# Rust toolchain + wasm target
 curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
+rustup show                                   # confirm the active stable toolchain
 rustup target add wasm32v1-none
+rustup target list --installed | grep wasm32v1-none
 
 # Stellar CLI
 cargo install --locked stellar-cli --features opt
+stellar --version                             # e.g. stellar 22.x.x
+```
 
-# Testnet account
+Testnet credentials are **optional**. Everything in [Setup & Installation](#setup--installation)
+and [Running Tests](#running-tests) works offline against the Soroban test host;
+only [Deploying to Testnet](#deploying-to-testnet) needs a funded account:
+
+```bash
+# Optional — only for testnet deployment / smoke testing
 stellar keys generate --global my-account --network testnet
 stellar keys fund my-account --network testnet
 ```
@@ -425,11 +499,22 @@ stellar keys fund my-account --network testnet
 
 ## Setup & Installation
 
+From a fresh clone to a passing local test run:
+
 ```bash
 git clone https://github.com/your-org/sorobanlard-contract.git
 cd sorobanlard-contract
-cargo check
+cargo check                                   # workspace compiles
+cargo test                                    # contract + invariant tests pass
+cd contracts/sorobanlard
+make build                                    # → target/wasm32v1-none/release/sorobanlard.wasm
 ```
+
+No network access, funded account, or `.env` file is required for the commands
+above. If `make build` fails with `can't find crate for 'core'` or a missing
+target error, re-run `rustup target add wasm32v1-none`.
+
+### Optional: testnet configuration
 
 Deployment variables that the Makefile reads (such as `STELLAR_ACCOUNT`) are listed in [`contracts/sorobanlard/.env.example`](contracts/sorobanlard/.env.example). Copy it to `.env` in that directory and export it before running `make deploy-testnet`:
 
@@ -439,15 +524,32 @@ cp .env.example .env
 set -a; source .env; set +a
 ```
 
+After deploying and calling `init`, [`scripts/smoke-test-testnet.sh`](scripts/smoke-test-testnet.sh)
+verifies the deployment end to end (see [Smoke test after deployment](#smoke-test-after-deployment)).
+Both steps are optional for local development.
+
 ---
 
 ## Running Tests
 
 ```bash
 cargo test
+cargo test -p sorobanlard          # contract package only
 cargo test -- --nocapture          # with output
 cargo test test_full_lifecycle     # single test
 ```
+
+The full contract suite, including the fee-split rounding, approved-token
+removal, revocation-challenge query, and bulk-revocation regression tests, is
+run with:
+
+```sh
+cargo test -p sorobanlard
+```
+
+Expected result: all tests pass (`test result: ok`).
+
+See [docs/running-tests.md](docs/running-tests.md) for package-scoped commands, running one test by name, and test-output options.
 
 Expected:
 ```
@@ -494,9 +596,20 @@ make build      # → target/wasm32v1-none/release/sorobanlard.wasm
 make optimize   # → target/wasm32v1-none/release/sorobanlard.optimized.wasm
 ```
 
+Deploy only `sorobanlard.optimized.wasm`. Verify its checksum and generate a
+release manifest as described in
+[docs/release-artifacts.md](docs/release-artifacts.md):
+
+```bash
+sha256sum contracts/sorobanlard/target/wasm32v1-none/release/sorobanlard.optimized.wasm
+scripts/release-manifest.sh
+```
+
 ---
 
 ## Deploying to Testnet
+
+Check required variables first with `./scripts/preflight-env.sh deploy` (see [docs/deployment-preflight.md](docs/deployment-preflight.md)). If funding or identity setup fails, see [docs/testnet-account-troubleshooting.md](docs/testnet-account-troubleshooting.md).
 
 ```bash
 export STELLAR_ACCOUNT=my-account
@@ -556,7 +669,9 @@ export STUDENT_ACCOUNT=student-account
 ./scripts/smoke-test-testnet.sh
 ```
 
-Exit codes: `0` if every step succeeded and `verify_certificate` returned `true`; `1` on a missing environment variable or missing `stellar` CLI; `2` if any contract call failed (the failing step is printed).
+Exit codes: `0` if every step succeeded and `verify_certificate` returned `true`; `1` on a missing environment variable or missing `stellar` CLI; `2` if any contract call failed (the failing step is printed); `3` if records for this run's IDs already exist (nothing is changed).
+
+**Rerunning is safe.** Each run uses a collision-resistant `SMOKE_RUN_ID` (`<unix time>-<random hex>`), so it creates a new free course and certificate rather than touching earlier ones. A read-only pre-check (`get_course`, `verify_certificate`) runs before any write; if `SMOKE_RUN_ID` is set to a value that was already used, the script exits `3` without submitting transactions. Only price-0 courses are used, so no paid-token transfers occur.
 
 ### Register and approve a test course
 
@@ -715,3 +830,60 @@ MIT
 
 <!-- handsoff-issue-146 -->
 - #146: Add invariant tests for accounting and multi-sig safety
+
+<!-- handsoff-issue-91 -->
+- #91: Test waitlist promotion never exceeds course capacity
+
+<!-- handsoff-issue-92 -->
+- #92: Test waitlist promotion order is FIFO
+
+<!-- handsoff-issue-93 -->
+- #93: Test duplicate waitlist joins are idempotent or rejected
+
+<!-- handsoff-issue-94 -->
+- #94: Test waitlist admission for courses without a capacity limit
+
+<!-- handsoff-issue-95 -->
+- #95: Test waitlist removal after a student enrolls directly
+
+<!-- handsoff-issue-96 -->
+- #96: Test waitlist event payloads for queue transitions
+
+<!-- handsoff-issue-97 -->
+- #97: Test arbitration escalation fee collection rollback
+
+<!-- handsoff-issue-98 -->
+- #98: Test arbitration timeout exactly at its configured ledger
+
+<!-- handsoff-issue-99 -->
+- #99: Test duplicate arbitration escalation for an open case
+
+<!-- handsoff-issue-100 -->
+- #100: Add a read-only arbitration case query for backend reconciliation
+
+<!-- handsoff-issue-101 -->
+- #101: Specify the subscription enrollment lifecycle
+
+<!-- handsoff-issue-102 -->
+- #102: Add persistent records for subscription enrollments
+
+<!-- handsoff-issue-103 -->
+- #103: Add an explicit paid subscription enrollment entrypoint
+
+<!-- handsoff-issue-104 -->
+- #104: Add explicit subscription renewal transactions
+
+<!-- handsoff-issue-105 -->
+- #105: Enforce subscription expiry in enrollment read queries
+
+<!-- handsoff-issue-106 -->
+- #106: Define subscription cancellation and refund behavior
+
+<!-- handsoff-issue-107 -->
+- #107: Emit events for subscription lifecycle changes
+
+<!-- handsoff-issue-108 -->
+- #108: Test subscription payment failures leave no partial state
+
+<!-- handsoff-issue-109 -->
+- #109: Add storage migration coverage for subscription records

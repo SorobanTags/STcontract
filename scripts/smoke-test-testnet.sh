@@ -14,11 +14,19 @@
 # Optional environment:
 #   NETWORK             stellar CLI network name (default: testnet)
 #   TOKEN_ADDRESS       approved SAC token used for the course (default: testnet USDC)
+#   SMOKE_RUN_ID        identifier suffix for this run (default: <unix time>-<random hex>)
+#
+# Rerunning: every run uses a fresh, collision-resistant SMOKE_RUN_ID, so it
+# registers a new course and certificate instead of reusing old ones. Before any
+# write, the script checks that the course and certificate IDs are unused; if a
+# record already exists (e.g. SMOKE_RUN_ID was reused) it exits 3 without
+# changing state. Only free (price 0) courses are used, so no paid tokens move.
 #
 # Exit codes:
 #   0  every step succeeded and verify_certificate returned true
 #   1  missing environment variable or stellar CLI
 #   2  a contract call failed (the failing step is printed)
+#   3  smoke-test records for this SMOKE_RUN_ID already exist (nothing changed)
 
 set -euo pipefail
 
@@ -37,7 +45,7 @@ if ! command -v stellar >/dev/null 2>&1; then
   exit 1
 fi
 
-RUN_ID="$(date +%s)"
+RUN_ID="${SMOKE_RUN_ID:-$(date +%s)-$(openssl rand -hex 4)}"
 COURSE_ID="SMOKE-${RUN_ID}"
 CERTIFICATE_ID="CERT-SMOKE-${RUN_ID}"
 CONTENT_HASH="$(openssl rand -hex 32)"
@@ -66,6 +74,26 @@ invoke() {
   echo "OK:   $step"
   printf '%s\n' "$output"
 }
+
+# Read-only pre-check: refuse to run if this run's records already exist.
+read_only() {
+  stellar contract invoke --id "$CONTRACT_ID" --source "$ADMIN_ACCOUNT" \
+    --network "$NETWORK" --send no -- "$@" 2>&1
+}
+if ! EXISTING_COURSE="$(read_only get_course --course_id "$COURSE_ID")"; then
+  echo "FAIL: pre-check get_course" >&2
+  echo "$EXISTING_COURSE" >&2
+  exit 2
+fi
+if [ "$(printf '%s' "$EXISTING_COURSE" | tr -d '[:space:]')" != "null" ]; then
+  echo "SKIP: course $COURSE_ID already exists; rerun without SMOKE_RUN_ID or pick a new one" >&2
+  exit 3
+fi
+if [ "$(read_only verify_certificate --certificate_id "$CERTIFICATE_ID" | tr -d '[:space:]"')" = "true" ]; then
+  echo "SKIP: certificate $CERTIFICATE_ID already exists; pick a new SMOKE_RUN_ID" >&2
+  exit 3
+fi
+echo "OK:   pre-check (no existing records for run $RUN_ID)"
 
 # add_approved_token is idempotent, so it is safe on an already-configured deployment.
 invoke "approve token" "$ADMIN_ACCOUNT" \
