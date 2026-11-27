@@ -5130,7 +5130,14 @@ impl SorobanLardContract {
             .unwrap_or(Self::DEFAULT_REVOCATION_CHALLENGE_PERIOD)
     }
 
-    /// Request a refund for an enrollment within the refund window
+    /// Request a refund for an enrollment within the refund window.
+    ///
+    /// Boundary rule: the request is accepted only while
+    /// `ledger_sequence - enrolled_at_ledger < refund_window`. The last
+    /// eligible ledger is therefore `enrolled_at_ledger + refund_window - 1`;
+    /// a request at exactly `enrolled_at_ledger + refund_window` or later
+    /// panics with `refund window has expired`. A window of `0` rejects all
+    /// requests.
     pub fn request_refund(env: Env, student: Address, course_id: String) {
         student.require_auth();
         env.storage()
